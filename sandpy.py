@@ -18,10 +18,12 @@ cursorposy = 0
 cursorx1 = 0
 cursory1 = 0
 
-def bill(x,y) :
-    if x > y :
-        return x - y
-    
+def drawred(x,y):
+   boardr[(round(cursorx1/32*2-x)+(round(cursory1/32*2-y)*16*2+33))%1024]= 255
+def drawgreen(x,y):
+   boardg[(round(cursorx1/32*2-x)+(round(cursory1/32*2-y)*16*2+33))%1024]= 255  
+def drawblue(x,y):
+   boardb[(round(cursorx1/32*2-x)+(round(cursory1/32*2-y)*16*2+33))%1024]= 255
 
 while True :
     col = col%255 + 1
@@ -39,11 +41,11 @@ while True :
         if cursory <= 480 :
          boardg[(round(cursory1/32*2)*16*2+33)%1024] = 255
          boardb[round(cursorx1/32*2)+33] = 255
-         boardr[(round(cursorx1/32*2+1)+(round(cursory1/32*2-1)*16*2+33))%1024]= 255
-         boardr[(round(cursorx1/32*2-1)+(round(cursory1/32*2-1)*16*2+33))%1024]= 255
-         boardr[(round(cursorx1/32*2+1)+(round(cursory1/32*2+1)*16*2+33))%1024]= 255
-         boardr[(round(cursorx1/32*2-1)+(round(cursory1/32*2+1)*16*2+33))%1024]= 255
-         boardr[(round(cursorx1/32*2)+(round(cursory1/32*2+1)*16*2+33))%1024]= 255
+         drawred(1,1)
+         drawred(-1,1)
+         drawred(-1,-1)
+         drawred(0,-1)
+         drawred(1,-1)
         if cursory > 480 :
          boardg[(round(cursory1/32*2)*16*2+33)%1024-1] = 255
          boardb[round(cursorx1/32*2)+33] = 255
@@ -60,6 +62,6 @@ while True :
     pygame.draw.rect(screen,(boardr[read],boardg[read],boardb[read]),pygame.Rect(posx-15.625,posy-15.625,16,16))
     pygame.display.flip()
     
-    print(cursory)
-
+    
+    print()
     
