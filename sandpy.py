@@ -15,6 +15,8 @@ cursorx = 0
 cursory = 0
 cursorposx = 0
 cursorposy = 0
+cursorx1 = 0
+cursory1 = 0
 
 def bill(x,y) :
     if x > y :
@@ -34,19 +36,30 @@ while True :
     read = read + 1
     if read > 1024 :
         read = 0
-        boardg[(round(cursory/32*2)*16*2+33)%1024] = 255
-        boardb[round(cursorx/32*2)+33] = 255
+        if cursory <= 480 :
+         boardg[(round(cursory1/32*2)*16*2+33)%1024] = 255
+         boardb[round(cursorx1/32*2)+33] = 255
+         boardr[(round(cursorx1/32*2+1)+(round(cursory1/32*2-1)*16*2+33))%1024]= 255
+         boardr[(round(cursorx1/32*2-1)+(round(cursory1/32*2-1)*16*2+33))%1024]= 255
+         boardr[(round(cursorx1/32*2+1)+(round(cursory1/32*2+1)*16*2+33))%1024]= 255
+         boardr[(round(cursorx1/32*2-1)+(round(cursory1/32*2+1)*16*2+33))%1024]= 255
+         boardr[(round(cursorx1/32*2)+(round(cursory1/32*2+1)*16*2+33))%1024]= 255
+        if cursory > 480 :
+         boardg[(round(cursory1/32*2)*16*2+33)%1024-1] = 255
+         boardb[round(cursorx1/32*2)+33] = 255
+         boardr[(round(cursorx1/32*2)+(round(cursory1/32*2)*16*2+33))%1024-1] = 255
     cursorposx, cursorposy = pygame.mouse.get_pos()
     cursorx = round(cursorposx/16)*16
     cursory = round(cursorposy/16)*16
-
+    cursorx1 = round(random.randrange(480)/16)*16
+    cursory1 = round(random.randrange(480)/16)*16
     
     for event in pygame.event.get():
         if event.type == pygame.quit :
             running = False
     pygame.draw.rect(screen,(boardr[read],boardg[read],boardb[read]),pygame.Rect(posx-15.625,posy-15.625,16,16))
     pygame.display.flip()
-    print(bill(round(cursory/32*2)*16*2+33,1024))
-    print(bill(10,20))
+    
+    print(cursory)
 
     
