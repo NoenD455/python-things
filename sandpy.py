@@ -7,9 +7,9 @@ posy = 0
 posx = 0
 running = True
 col = 0
-boardr = [random.randint(0, 100) for _ in range(1025)]
-boardg = [random.randint(0, 100) for _ in range(1025)]
-boardb = [random.randint(0, 100) for _ in range(1025)]
+boardr = [random.randint(0, 255) for _ in range(1025)]
+boardg = [random.randint(0, 255) for _ in range(1025)]
+boardb = [random.randint(0, 50) for _ in range(1025)]
 read = 0
 cursorx = 0
 cursory = 0
@@ -24,6 +24,13 @@ def drawgreen(x,y):
    boardg[(round(cursorx1/32*2-x)+(round(cursory1/32*2-y)*16*2+33))%1024]= 255  
 def drawblue(x,y):
    boardb[(round(cursorx1/32*2-x)+(round(cursory1/32*2-y)*16*2+33))%1024]= 255
+
+def getred(x,y):
+    return   boardr[(round(cursorx1/32*2-x)+(round(cursory1/32*2-y)*16*2+33))%1024]
+def getgreen(x,y):
+    return   boardg[(round(cursorx1/32*2-x)+(round(cursory1/32*2-y)*16*2+33))%1024]  
+def getblue(x,y):
+    return   boardb[(round(cursorx1/32*2-x)+(round(cursory1/32*2-y)*16*2+33))%1024]
 
 while True :
     col = col%255 + 1
@@ -41,11 +48,12 @@ while True :
         if cursory <= 480 :
          boardg[(round(cursory1/32*2)*16*2+33)%1024] = 255
          boardb[round(cursorx1/32*2)+33] = 255
-         drawred(1,1)
-         drawred(-1,1)
-         drawred(-1,-1)
-         drawred(0,-1)
-         drawred(1,-1)
+        
+        if getblue(0,1) > 50 :
+            drawblue(0,0)
+            drawred(0,0)
+            print(getblue(0,1) >= 50)
+            print(getblue(0,1))
         if cursory > 480 :
          boardg[(round(cursory1/32*2)*16*2+33)%1024-1] = 255
          boardb[round(cursorx1/32*2)+33] = 255
@@ -63,5 +71,5 @@ while True :
     pygame.display.flip()
     
     
-    print()
+
     
