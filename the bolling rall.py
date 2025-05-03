@@ -11,7 +11,7 @@ xm = 0
 ym = 0
 running = True
 while running:
-    dist = abs((abs(xm) - abs(x)) + (abs(ym) - abs(y)))
+    dist = abs(abs(abs(xm) - abs(x)) + abs(abs(ym) - abs(y)))
     sdist = int(round(dist))
     
 
