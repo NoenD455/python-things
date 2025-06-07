@@ -1,5 +1,7 @@
 import pygame
 import math
+pygame.font.init()
+font = pygame.font.SysFont('Arial', 30)
 pygame.init()
 def euclidean_distance(point1, point2):
     distance = 0
@@ -20,6 +22,7 @@ tempx1 = velx1
 tempy1 = vely1
 x1 = 480
 y1 = 250
+reload = 3
 mx, my = pygame.mouse.get_pos()
 #   dont touch
 while running:
@@ -29,6 +32,14 @@ while running:
     screen.fill((0,0,0))
     pygame.draw.circle(screen,(255,255,0),(x,y),40)
     pygame.draw.circle(screen,(255,0,255),(x1,y1),20)
+
+    text = font.render(str(round(reload, 2)), 0, (255, 255, 255))
+    csad = pygame.transform.scale(text,(abs(math.sqrt(abs(velx+velx1)/20)*10+64),abs(math.sqrt(abs(vely+vely1)/2)*10+32)))
+    rectfont = text.get_rect()
+    rectfont.topleft = (0, 0)
+
+    screen.blit(csad, rectfont)
+
     pygame.display.update()
     x += velx/100
     y += vely/100
@@ -42,16 +53,16 @@ while running:
     #   collision
     if euclidean_distance((x,y), (x1,y1))<=60:
         x = x + tempx1/100
-        velx = tempx1 
+        velx = tempx1 /reload
         
         x1 = x1 + tempx/100
-        velx1 = tempx /2
+        velx1 = tempx /1
         
         y = y  + tempy1/100
-        vely = tempy1 
+        vely = tempy1 /reload
         
         y1 = y1 + tempy/100
-        vely1 = tempy 
+        vely1 = tempy /1
         
 
     
@@ -106,6 +117,8 @@ while running:
     elif keys[pygame.K_s]:
         vely = vely + 0.025
     
+    if keys[pygame.K_SPACE]:
+        reload = 0.5
     
     # damp
 
@@ -113,4 +126,8 @@ while running:
     velx1 = velx1 / 1.001
     vely = vely / 1.001
     vely1 = vely1 / 1.001
+    if reload < 3:
+        reload = reload * 1.000125
+
+
 
