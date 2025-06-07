@@ -1,7 +1,7 @@
 import pygame
 import math
 pygame.font.init()
-font = pygame.font.SysFont('Arial', 30)
+font = pygame.font.SysFont('Impact', 30)
 pygame.init()
 def euclidean_distance(point1, point2):
     distance = 0
@@ -23,18 +23,20 @@ tempy1 = vely1
 x1 = 480
 y1 = 250
 reload = 3
+string = "READY " + str(round(reload, 2))
+time = 0
 mx, my = pygame.mouse.get_pos()
 #   dont touch
 while running:
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
             running = False
+    time = time + 0.001
     screen.fill((0,0,0))
     pygame.draw.circle(screen,(255,255,0),(x,y),40)
     pygame.draw.circle(screen,(255,0,255),(x1,y1),20)
-
-    text = font.render(str(round(reload, 2)), 0, (255, 255, 255))
-    csad = pygame.transform.scale(text,(abs(math.sqrt(abs(velx+velx1)/20)*10+64),abs(math.sqrt(abs(vely+vely1)/2)*10+32)))
+    text = font.render(string, 0, ((math.sin(time)*255)%255, (math.sin(time*2)*255)%255, (math.sin(time*3)*255)%255))
+    csad = pygame.transform.scale(text,(abs(math.sqrt(abs(velx+velx1)/20)*10+256),abs(math.sqrt(abs(vely+vely1)/2)*10+32)))
     rectfont = text.get_rect()
     rectfont.topleft = (0, 0)
 
@@ -117,7 +119,7 @@ while running:
     elif keys[pygame.K_s]:
         vely = vely + 0.025
     
-    if keys[pygame.K_SPACE]:
+    if keys[pygame.K_SPACE] and math.floor(reload) == 3:
         reload = 0.5
     
     # damp
@@ -128,6 +130,10 @@ while running:
     vely1 = vely1 / 1.001
     if reload < 3:
         reload = reload * 1.000125
+    if math.floor(reload) == 3:
+        string = "READY " + str(round(reload, 2))
+    elif not math.floor(reload) == 3:
+        string = "CHARGING " + str(round(reload, 2))
 
 
 
