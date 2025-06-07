@@ -1,20 +1,27 @@
 import pygame
 import math
 pygame.init()
+def euclidean_distance(point1, point2):
+    distance = 0
+    for i in range(len(point1)):
+        distance += (point1[i] - point2[i]) ** 2
+    return math.sqrt(distance)
 screen = pygame.display.set_mode((500,500))
 running = True
-velx = 32
-vely = 2
+velx = 0
+vely = 0
 tempx = velx
 tempy = vely
 x = 40
 y = 250
-velx1 = -1
-vely1 = -10
+velx1 = 0
+vely1 = 0
 tempx1 = velx1
 tempy1 = vely1
 x1 = 480
 y1 = 250
+mx, my = pygame.mouse.get_pos()
+#   dont touch
 while running:
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
@@ -31,13 +38,25 @@ while running:
     tempx = velx
     tempy1 = vely1
     tempy = vely
-    if abs(abs(abs(x1) - abs(x))+abs(abs(y1) - abs(y)))<=80:
-        velx = tempx1
-        velx1 = tempx
-        vely = tempy1
-        vely1 = tempy
     
+    #   collision
+    if euclidean_distance((x,y), (x1,y1))<=60:
+        x = x + tempx1/100
+        velx = tempx1 
+        
+        x1 = x1 + tempx/100
+        velx1 = tempx /2
+        
+        y = y  + tempy1/100
+        vely = tempy1 
+        
+        y1 = y1 + tempy/100
+        vely1 = tempy 
+        
+
     
+    mx, my = pygame.mouse.get_pos()
+    #   bound
     if x1 > 480:
         velx1 = -velx1
     if x1 < 20:
@@ -58,3 +77,40 @@ while running:
         vely = -vely
     if y < 40:
         vely = -vely
+
+
+    
+    #   tiny
+    
+    keys = pygame.key.get_pressed()
+
+    
+    if keys[pygame.K_LEFT]:
+        velx1 = velx1 - 0.025
+    elif keys[pygame.K_RIGHT]:
+        velx1 = velx1 + 0.025
+
+    if keys[pygame.K_UP]:
+        vely1 = vely1 - 0.025
+    elif keys[pygame.K_DOWN]:
+        vely1 = vely1 + 0.025
+    
+    #   BIF
+    if keys[pygame.K_a]:
+        velx = velx - 0.025
+    elif keys[pygame.K_d]:
+        velx = velx + 0.025
+
+    if keys[pygame.K_w]:
+        vely = vely - 0.025
+    elif keys[pygame.K_s]:
+        vely = vely + 0.025
+    
+    
+    # damp
+
+    velx = velx / 1.001
+    velx1 = velx1 / 1.001
+    vely = vely / 1.001
+    vely1 = vely1 / 1.001
+
