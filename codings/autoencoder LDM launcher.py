@@ -76,6 +76,7 @@ class AEFlowApp(ldm.RectifiedFlowApp):
                 latent_h=self.vae_settings['vae_latent_h'].get(),
                 latent_w=self.vae_settings['vae_latent_w'].get(),
                 size=self.vae_settings['vae_size'].get(),
+                img_size=self.global_settings['img_size'].get(),
             ).to('cpu')
             self.vae_optimizer = torch.optim.Adam(
                 self.vae_model.parameters(),
