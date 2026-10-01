@@ -305,11 +305,46 @@ VAE_SIZE_CONFIGS = {
     'large':  (3, [2.0, 4.0, 8.0]),
 }
 
+# ---------- VAE helpers ----------
+
+def _vae_num_blocks(img_size, latent_h, latent_w):
+    """How many stride-2 blocks are needed to go img_size -> latent exactly."""
+    if img_size % latent_h or img_size % latent_w:
+        raise ValueError(
+            f"img_size={img_size} must be divisible by latent {latent_h}x{latent_w}"
+        )
+    rh, rw = img_size // latent_h, img_size // latent_w
+    if rh != rw:
+        raise ValueError(f"non-square downsampling ratio {rh}:{rw} not supported")
+    n = int(round(math.log2(rh)))
+    if 2 ** n != rh:
+        raise ValueError(f"ratio {rh} is not a power of 2")
+    if n < 1:
+        raise ValueError(f"need at least 1 downsampling block, got ratio {rh}")
+    return n
+
+def _fit_mults(mults, n):
+    """Extend/truncate mults to length n. Extend by doubling the last value."""
+    if len(mults) == n:
+        return list(mults)
+    if len(mults) > n:
+        return list(mults[:n])
+    ext = list(mults)
+    while len(ext) < n:
+        ext.append(ext[-1] * 2)
+    return ext
+
+# ---------- Encoder ----------
+
 class FlexEncoder(nn.Module):
     def __init__(self, in_channels=3, base_channels=32, latent_channels=8,
-                 latent_h=4, latent_w=4, size='big'):
+                 latent_h=4, latent_w=4, size='big', img_size=32):
         super().__init__()
-        num_blocks, mults = VAE_SIZE_CONFIGS[size]
+        _, mults = VAE_SIZE_CONFIGS[size]
+        n = _vae_num_blocks(img_size, latent_h, latent_w)
+        mults = _fit_mults(mults, n)
+        self.latent_h, self.latent_w = latent_h, latent_w
+
         self.down = nn.ModuleList()
         c = in_channels
         for m in mults:
@@ -319,60 +354,75 @@ class FlexEncoder(nn.Module):
             c = oc
         self.conv_mu = nn.Conv2d(c, latent_channels, 3, padding=1)
         self.conv_logvar = nn.Conv2d(c, latent_channels, 3, padding=1)
-        self.pool = nn.AdaptiveAvgPool2d((latent_h, latent_w))
+        # No AdaptiveAvgPool — sizes are exact now.
+
     def forward(self, x):
-        for l in self.down: x = l(x)
-        return self.pool(self.conv_mu(x)), self.pool(self.conv_logvar(x))
+        for l in self.down:
+            x = l(x)
+        return self.conv_mu(x), self.conv_logvar(x)
+
+# ---------- Decoder ----------
 
 class FlexDecoder(nn.Module):
     def __init__(self, latent_channels=8, base_channels=32, out_channels=3,
-                 latent_h=4, latent_w=4, size='big'):
+                 latent_h=4, latent_w=4, size='big', img_size=32):
         super().__init__()
+        _, mults = VAE_SIZE_CONFIGS[size]
+        n = _vae_num_blocks(img_size, latent_h, latent_w)
+        mults = _fit_mults(mults, n)
+        widths = [max(1, int(base_channels * m)) for m in mults]
         self.latent_h, self.latent_w = latent_h, latent_w
-        num_blocks, mults = VAE_SIZE_CONFIGS[size]
-        high = max(1, int(base_channels * mults[-1]))
+
+        high = widths[-1]
         self.init_conv = nn.Conv2d(latent_channels, high, 3, padding=1)
         self.act = nn.LeakyReLU(0.2)
         self.up = nn.ModuleList()
         c = high
-        for i in range(num_blocks):
-            oc = (max(1, int(base_channels * mults[num_blocks - 2 - i]))
-                  if i < num_blocks - 1 else base_channels)
+        for i in range(n):
+            oc = widths[n - 2 - i] if i < n - 1 else widths[0]
             self.up.append(nn.ConvTranspose2d(c, oc, 4, stride=2, padding=1))
             self.up.append(nn.LeakyReLU(0.2))
             c = oc
         self.conv_out = nn.Conv2d(c, out_channels, 3, padding=1)
+
     def forward(self, z, target_size=None):
-        if z.shape[2] != self.latent_h or z.shape[3] != self.latent_w:
-            z = F_nn.interpolate(z, size=(self.latent_h, self.latent_w),
-                                 mode='bilinear', align_corners=False)
         x = self.act(self.init_conv(z))
-        for l in self.up: x = l(x)
+        for l in self.up:
+            x = l(x)
         out = torch.tanh(self.conv_out(x))
+        # Safety net only — should be a no-op with the fix
         if target_size and (out.shape[2] != target_size[0] or out.shape[3] != target_size[1]):
-            out = F_nn.interpolate(out, size=target_size, mode='bilinear', align_corners=False)
+            out = F_nn.interpolate(out, size=target_size, mode='bilinear',
+                                   align_corners=False)
         return out
+
+# ---------- VAE wrapper ----------
 
 class FlexVAE(nn.Module):
     def __init__(self, in_channels=3, base_channels=32, latent_channels=8,
-                 latent_h=4, latent_w=4, size='big'):
+                 latent_h=4, latent_w=4, size='big', img_size=32):
         super().__init__()
         self.encoder = FlexEncoder(in_channels, base_channels, latent_channels,
-                                    latent_h, latent_w, size)
+                                   latent_h, latent_w, size, img_size)
         self.decoder = FlexDecoder(latent_channels, base_channels, in_channels,
-                                    latent_h, latent_w, size)
+                                   latent_h, latent_w, size, img_size)
         self.latent_channels = latent_channels
         self.latent_h, self.latent_w = latent_h, latent_w
         self.size = size
+        self.img_size = img_size
+
     def reparameterize(self, mu, logvar):
         std = torch.exp(0.5 * logvar)
         return mu + torch.randn_like(std) * std
+
     def forward(self, x):
         mu, logvar = self.encoder(x)
         z = self.reparameterize(mu, logvar)
         return self.decoder(z, (x.shape[2], x.shape[3])), mu, logvar
+
     def encode(self, x):
         return self.encoder(x)[0]
+
     def decode(self, z, target_size=None):
         return self.decoder(z, target_size)
 
@@ -1270,13 +1320,14 @@ class RectifiedFlowApp:
         try:
             in_ch = 3 if self.global_settings['color_mode'].get() == 'rgb' else 1
             self.vae_model = FlexVAE(
-                in_channels=in_ch,
-                base_channels=self.vae_settings['vae_base_channels'].get(),
-                latent_channels=self.vae_settings['vae_latent_channels'].get(),
-                latent_h=self.vae_settings['vae_latent_h'].get(),
-                latent_w=self.vae_settings['vae_latent_w'].get(),
-                size=self.vae_settings['vae_size'].get(),
-            ).to('cpu')
+    			in_channels=in_ch,
+    			base_channels=self.vae_settings['vae_base_channels'].get(),
+    			latent_channels=self.vae_settings['vae_latent_channels'].get(),
+    			latent_h=self.vae_settings['vae_latent_h'].get(),
+    			latent_w=self.vae_settings['vae_latent_w'].get(),
+    			size=self.vae_settings['vae_size'].get(),
+    			img_size=self.global_settings['img_size'].get(),   # <-- ADD THIS
+			).to('cpu')
             self.vae_optimizer = optim.Adam(self.vae_model.parameters(),
                                             lr=self.vae_settings['vae_lr'].get())
             self.log_vae(f"VAE initialized (size={self.vae_settings['vae_size'].get()}).")
