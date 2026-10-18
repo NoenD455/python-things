@@ -713,6 +713,7 @@ class RectifiedFlowPixel:
 
     # ---------- train step ----------
     def train_step(self, x1, cond=None, cfg_dropout_prob=0.0):
+        self.model.train()
         x1 = x1.to(self.device)
         B = x1.size(0)
 
@@ -763,6 +764,7 @@ class RectifiedFlowPixel:
     def sample(self, n_samples=16, cond=None, steps=50, method='euler', cfg_scale=1.0,
                use_ema=True, start_from=None):
         model = self.ema_model if (use_ema and self.use_ema and self.ema_model is not None) else self.model
+        model.eval()
         img_shape = (self.in_channels, self.img_size[0], self.img_size[1])
 
         x = start_from.to(self.device) if start_from is not None \
