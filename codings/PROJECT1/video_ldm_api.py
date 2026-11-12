@@ -5,6 +5,7 @@ Video Latent Rectified Flow — API / backend.
 Contains video-specific logic:
   - VideoFrameDataset (autoregressive, history frames per sample)
   - VelocityUNet with temporal context + per-level attention toggles
+    + conditioning mode (shift / film / adagn / cross_attn)
   - RectifiedFlowLatent with autoregressive video sampling
     (batch + step-by-step generators)
 
@@ -111,21 +112,30 @@ def load_video_frames(path, stride=1):
 
 # ==================== Temporal VelocityUNet ====================
 
+VALID_COND_MODES = ('shift', 'film', 'adagn', 'cross_attn')
+
+
 class VelocityUNet(nn.Module):
     """UNet that accepts [B, C*(1+history), H, W] where the first C channels
     are the noisy latent for the current frame, and the rest are the history
     context latents (oldest → newest). Outputs [B, C, H, W] velocity.
 
-    Attention is now configurable per-resolution (like the image LDM):
+    Attention is configurable per-resolution (like the image LDM):
       attention_levels[0] → block at the highest spatial resolution
       attention_levels[1] → next level down (if any)
       attention_levels[2] → lowest level / mid block
+
+    Conditioning mode is one of:
+      'shift'      → additive conditioning  (legacy default)
+      'film'       → scale + shift conditioning
+      'adagn'      → adaptive GroupNorm
+      'cross_attn' → cross-attention with cond as KV
     """
     def __init__(self, latent_channels=8, history=1, base_channels=32,
                  time_emb_dim=128, cond_dim=256,
                  latent_h=4, latent_w=4, channel_mult=(1, 2, 4), dropout=0.1,
                  attention_levels=None, attn_num_heads=4, attn_dropout=0.0,
-                 padding_mode='constant'):
+                 padding_mode='constant', cond_mode='shift'):
         super().__init__()
         self.latent_channels = latent_channels
         self.history = history
@@ -138,6 +148,7 @@ class VelocityUNet(nn.Module):
         self.padding_mode = padding_mode
         self.attn_num_heads = attn_num_heads
         self.attn_dropout = attn_dropout
+        self.cond_mode = cond_mode if cond_mode in VALID_COND_MODES else 'shift'
         self.latent_h = latent_h
         self.latent_w = latent_w
 
@@ -173,7 +184,8 @@ class VelocityUNet(nn.Module):
                 use_attention=attn_flags[i],
                 attn_num_heads=attn_num_heads,
                 attn_dropout=attn_dropout,
-                padding_mode=padding_mode))
+                padding_mode=padding_mode,
+                cond_mode=self.cond_mode))
             if i < len(mult_used) - 1:
                 self.downs.append(nn.Conv2d(out, out, 4, stride=2, padding=1))
             cur = out
@@ -184,13 +196,15 @@ class VelocityUNet(nn.Module):
             use_attention=mid_attn,
             attn_num_heads=attn_num_heads,
             attn_dropout=attn_dropout,
-            padding_mode=padding_mode)
+            padding_mode=padding_mode,
+            cond_mode=self.cond_mode)
         self.mid_block2 = UpBlock(
             cur, cur, time_emb_dim, cond_dim, dropout,
             use_attention=mid_attn,
             attn_num_heads=attn_num_heads,
             attn_dropout=attn_dropout,
-            padding_mode=padding_mode)
+            padding_mode=padding_mode,
+            cond_mode=self.cond_mode)
 
         self.ups = nn.ModuleList()
         rev = list(reversed(mult_used))
@@ -202,7 +216,8 @@ class VelocityUNet(nn.Module):
                 use_attention=rev_attn[i],
                 attn_num_heads=attn_num_heads,
                 attn_dropout=attn_dropout,
-                padding_mode=padding_mode))
+                padding_mode=padding_mode,
+                cond_mode=self.cond_mode))
             if i < len(rev) - 1:
                 self.ups.append(nn.ConvTranspose2d(out, out, 4, stride=2, padding=1))
             cur = out
@@ -239,12 +254,14 @@ class RectifiedFlowLatent:
     def __init__(self, latent_channels=8, latent_h=4, latent_w=4, history=1,
                  base_channels=32, cond_dim=256, device=None,
                  attention_levels=None, attn_num_heads=4, attn_dropout=0.0,
-                 padding_mode='constant', channel_mult=(1, 2, 4)):
+                 padding_mode='constant', cond_mode='shift',
+                 channel_mult=(1, 2, 4)):
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.latent_channels = latent_channels
         self.latent_h, self.latent_w = latent_h, latent_w
         self.history = history
         self.cond_dim = cond_dim
+        self.cond_mode = cond_mode if cond_mode in VALID_COND_MODES else 'shift'
         self.use_ot = False
         self.ot_method = 'sinkhorn'
         self.ot_sinkhorn_eps = 0.05
@@ -255,6 +272,7 @@ class RectifiedFlowLatent:
             attention_levels=attention_levels,
             attn_num_heads=attn_num_heads,
             attn_dropout=attn_dropout,
+            cond_mode=self.cond_mode,
         )
 
         self.model = VelocityUNet(
@@ -479,8 +497,6 @@ class RectifiedFlowLatent:
         completed = []
 
         for fi in range(num_frames):
-            # snapshot completed frames once per frame (cheap; they don't change
-            # during the inner ODE loop)
             completed_snapshot = [f.clone() for f in completed]
             z = torch.randn(*shape, device=self.device)
             ctx_flat = None
@@ -621,8 +637,6 @@ class VideoFrameDataset(Dataset):
         try:
             src_idx, start, lbls = self.samples[idx]
             frames = self.source_frames[src_idx]
-            # Seed the RNG identically for every frame in the window so that
-            # random augmentations stay temporally consistent.
             seed = random.randint(0, 2**31 - 1)
             seq = []
             for i in range(self.history + 1):

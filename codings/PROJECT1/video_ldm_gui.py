@@ -8,6 +8,7 @@ Tabs: Dataset | VAE Settings | VAE Training | Flow Settings | Flow Training |
 New in this version (matching the image LDM):
   * Per-level attention toggles (L0/L1/L2), attn_num_heads, attn_dropout
     + live head-dim label
+  * Conditioning mode selector (shift / film / adagn / cross_attn)
   * Generation tab: Stop button + Progressive preview + Update-interval
   * Stop works mid-ODE-step in progressive mode, between frames otherwise
 """
@@ -32,7 +33,7 @@ from video_ldm_api import (
     FlexVAE, RectifiedFlowLatent, VideoFrameDataset, load_video_frames,
     load_image_as_rgb, load_image_as_grayscale, text_to_indices,
     TextEncoder, TransformerTextEncoder, get_encoder_config,
-    VIDEO_EXTS, IMAGE_EXTS, _HAS_CV2, _HAS_IMAGEIO,
+    VIDEO_EXTS, IMAGE_EXTS, _HAS_CV2, _HAS_IMAGEIO, VALID_COND_MODES,
 )
 from flow_api import compute_head_dims
 
@@ -129,7 +130,7 @@ class RectifiedFlowApp:
             'vae_kl_weight': tk.DoubleVar(value=0.0001),
         }
 
-        # ---- Flow settings (now with per-level attention like image LDM) ----
+        # ---- Flow settings (per-level attention + cond_mode like image LDM) ----
         self.flow_settings = {
             'flow_base_channels': tk.IntVar(value=32),
             'flow_padding_mode': tk.StringVar(value='constant'),
@@ -164,6 +165,8 @@ class RectifiedFlowApp:
             'cond_ff_dim': tk.IntVar(value=256),
             'cond_dim': tk.IntVar(value=256),
             'cond_text_max_len': tk.IntVar(value=128),
+            # NEW: conditioning mode (shift / film / adagn / cross_attn)
+            'cond_mode': tk.StringVar(value='shift'),
         }
 
         self.vae_aug_settings = default_aug_dict()
@@ -190,7 +193,7 @@ class RectifiedFlowApp:
         self._anim_photo = None
         self.frame_stride = tk.IntVar(value=1)
 
-        # NEW: generation control
+        # Generation control
         self.gen_stop_flag = False
         self.progressive_preview = tk.BooleanVar(value=False)
         self.prog_interval = tk.IntVar(value=10)
@@ -415,6 +418,12 @@ class RectifiedFlowApp:
                     ['BiGRU', 'BiTransformer'])
         self._combo(cf, "Encoder size:", self.flow_settings['text_encoder_size'],
                     ['tiny', 'small', 'medium', 'large'])
+        # NEW: cond_mode selector
+        self._combo(cf, "Cond mode:", self.flow_settings['cond_mode'],
+                    list(VALID_COND_MODES))
+        tk.Label(cf, text="shift = additive · film = scale+shift · "
+                          "adagn = adaptive GroupNorm · cross_attn = cross-attention",
+                 fg='gray', font=("Arial", 8, "italic")).pack(anchor='w')
         tk.Button(cf, text="Apply preset to dims",
                   command=self.apply_text_encoder_preset).pack(pady=3)
         self._spin(cf, "Embed dim:", self.flow_settings['cond_embed_dim'], 8, 512)
@@ -807,6 +816,7 @@ class RectifiedFlowApp:
             'text_encoder_size': 'small', 'cond_embed_dim': 64, 'cond_hidden_size': 64,
             'cond_num_layers': 2, 'cond_num_heads': 4, 'cond_ff_dim': 256,
             'cond_dim': 256, 'cond_text_max_len': 128,
+            'cond_mode': 'shift',
         }.items():
             self.flow_settings[k].set(v)
         self.global_settings['img_size'].set(32)
@@ -989,6 +999,10 @@ class RectifiedFlowApp:
             attn_num_heads = int(self.flow_settings['attn_num_heads'].get())
             attn_dropout = float(self.flow_settings['attn_dropout'].get())
 
+            cond_mode = self.flow_settings['cond_mode'].get()
+            if cond_mode not in VALID_COND_MODES:
+                cond_mode = 'shift'
+
             self.rectified_model = RectifiedFlowLatent(
                 latent_channels=self.vae_settings['vae_latent_channels'].get(),
                 latent_h=self.vae_settings['vae_latent_h'].get(),
@@ -1000,6 +1014,7 @@ class RectifiedFlowApp:
                 attn_num_heads=attn_num_heads,
                 attn_dropout=attn_dropout,
                 padding_mode=self.flow_settings['flow_padding_mode'].get(),
+                cond_mode=cond_mode,
                 channel_mult=(1, 2, 4),
             )
             self.rectified_model.use_ot = self.flow_settings['flow_use_ot'].get()
@@ -1044,12 +1059,12 @@ class RectifiedFlowApp:
                 )
                 self.log_rectified(
                     f"Conditional Flow model initialized ({enc}, history={history}, "
-                    f"attn={attn_levels}, heads={attn_num_heads}).")
+                    f"attn={attn_levels}, heads={attn_num_heads}, cond_mode={cond_mode}).")
             else:
                 self.text_encoder = None
                 self.log_rectified(
                     f"Unconditional Flow model initialized (history={history}, "
-                    f"attn={attn_levels}, heads={attn_num_heads}).")
+                    f"attn={attn_levels}, heads={attn_num_heads}, cond_mode={cond_mode}).")
         except Exception as e:
             import traceback; traceback.print_exc()
             self.log_rectified(f"Init error: {e}")
@@ -1219,10 +1234,11 @@ class RectifiedFlowApp:
                 'use_ot': self.rectified_model.use_ot,
                 'channel_mult': (1, 2, 4),
                 'history': self.rectified_model.history,
-                # top-level duplicates for robustness
+                # top-level duplicates for robustness / future loaders
                 'attn_levels': self.rectified_model.model.attention_levels,
                 'attn_num_heads': self.rectified_model.model.attn_num_heads,
                 'attn_dropout': self.rectified_model.model.attn_dropout,
+                'cond_mode': self.rectified_model.cond_mode,
             }
             if self.text_encoder is not None:
                 d['text_encoder_state'] = self.text_encoder.state_dict()
@@ -1266,6 +1282,20 @@ class RectifiedFlowApp:
                 self.flow_settings['attn_num_heads'].set(ckpt['attn_num_heads'])
             if 'attn_dropout' in ckpt:
                 self.flow_settings['attn_dropout'].set(ckpt['attn_dropout'])
+
+            # cond_mode: top-level takes priority; if neither present, default
+            # to legacy 'shift' so old checkpoints load with the correct
+            # architecture (they were trained with shift mode).
+            if 'cond_mode' not in fs:
+                try:
+                    self.flow_settings['cond_mode'].set('shift')
+                except Exception:
+                    pass
+            if 'cond_mode' in ckpt:
+                try:
+                    self.flow_settings['cond_mode'].set(ckpt['cond_mode'])
+                except Exception:
+                    pass
 
             if not self.vae_model:
                 self.log_rectified("Load VAE first, then retry."); return
