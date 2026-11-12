@@ -9,8 +9,11 @@ New in this version:
   * Per-level attention toggles (L0/L1/L2), attn_num_heads, attn_dropout
   * Conditioning mode selector (shift / film / adagn / cross_attn)
   * Augmentation padding mode (edge / reflect / symmetric / constant)
-  * New Continue tab: generate continuation from an image or a video frame
-    (supports negative frame indices; respects the model's history context)
+  * Continue tab:
+      - generate continuation from an image or a video frame
+        (supports negative frame indices; respects model history context)
+      - context preview shows VAE round-trip (what the model actually sees)
+      - playback controls: Play / Pause / FPS / Show All Frames
   * Generation tab: Stop button + Progressive preview + Update-interval
 """
 import tkinter as tk
@@ -20,7 +23,7 @@ import torch.optim as optim
 import torch.nn.functional as F_nn
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
-from PIL import Image, ImageTk
+from PIL import Image, ImageTk, ImageDraw
 import os
 import threading
 import queue
@@ -197,7 +200,7 @@ class RectifiedFlowApp:
         self.prog_interval = tk.IntVar(value=10)
 
         # ---- Continue tab state ----
-        self.continue_mode = tk.StringVar(value='image')  # 'image' | 'video'
+        self.continue_mode = tk.StringVar(value='image')
         self.continue_image_path = None
         self.continue_video_path = None
         self.continue_video_frames = []
@@ -213,6 +216,11 @@ class RectifiedFlowApp:
         self.continue_in_progress = False
         self.continue_context_photo = None
         self.continue_gen_photo = None
+        # Playback
+        self.continue_playback_active = False
+        self.continue_playback_idx = 0
+        self.continue_playback_after_id = None
+        self.continue_gen_frames_pil = []   # list[PIL] one per frame
 
         self.setup_gui()
         self.root.after(100, self.process_messages_vae)
@@ -527,7 +535,6 @@ class RectifiedFlowApp:
         def row():
             f = tk.Frame(parent); f.pack(fill=tk.X, pady=2); return f
 
-        # Aug padding mode (affects Rotation / Perspective / Elastic)
         r = row()
         tk.Label(r, text="Aug padding mode:").pack(side=tk.LEFT)
         ttk.Combobox(r, textvariable=aug['aug_padding_mode'],
@@ -682,7 +689,7 @@ class RectifiedFlowApp:
         prev_row = tk.Frame(prev); prev_row.pack(fill=tk.X)
 
         left = tk.Frame(prev_row); left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 4))
-        tk.Label(left, text="Context (history, what the model sees)").pack(anchor='w')
+        tk.Label(left, text="Context (history — VAE round-trip view)").pack(anchor='w')
         self.continue_context_canvas = tk.Canvas(left, bg='gray', width=384, height=100)
         self.continue_context_canvas.pack(anchor='w')
 
@@ -735,6 +742,25 @@ class RectifiedFlowApp:
                                             command=self.continue_stop,
                                             bg="salmon", state=tk.DISABLED)
         self.continue_stop_btn.pack(side=tk.LEFT, padx=2)
+
+        # --- Playback controls ---
+        play_row = tk.Frame(gen); play_row.pack(fill=tk.X, pady=2)
+        tk.Label(play_row, text="Playback:", fg="gray").pack(side=tk.LEFT)
+        self.continue_play_btn = tk.Button(
+            play_row, text="▶ Play",
+            command=self._continue_start_playback, state=tk.DISABLED)
+        self.continue_play_btn.pack(side=tk.LEFT, padx=(4, 2))
+        self.continue_pause_btn = tk.Button(
+            play_row, text="⏸ Pause",
+            command=self._continue_pause_playback, state=tk.DISABLED)
+        self.continue_pause_btn.pack(side=tk.LEFT, padx=2)
+        self.continue_show_all_btn = tk.Button(
+            play_row, text="Show All Frames",
+            command=self._continue_show_strip, state=tk.DISABLED)
+        self.continue_show_all_btn.pack(side=tk.LEFT, padx=2)
+        tk.Label(play_row, text="FPS:").pack(side=tk.LEFT, padx=(10, 2))
+        tk.Spinbox(play_row, from_=1, to=60, textvariable=self.playback_fps,
+                   width=4).pack(side=tk.LEFT)
 
         self._on_continue_mode_change()
 
@@ -790,10 +816,9 @@ class RectifiedFlowApp:
         self._continue_refresh_context_preview()
 
     def _continue_get_context_pils(self):
-        """Return (list_of_pils_or_None, description).
+        """Returns (list_of_pils_or_None, description).
 
-        Length of list equals model `history`. None entries are zero-padding
-        slots (rendered black in the preview).
+        Length equals the model's `history`. `None` entries are padding slots.
         """
         history = self.flow_settings['flow_history'].get()
 
@@ -835,17 +860,83 @@ class RectifiedFlowApp:
                 192, 50, text=desc, fill="white")
             self.continue_info.config(text=desc)
             return
-        self._display_continue_context(ctx, desc)
 
-    def _display_continue_context(self, context_pils, desc):
+        padding_flags = [p is None for p in ctx]
+
+        # Preferred view: VAE round-trip of the exact tensors fed to the model.
+        if self.vae_model is not None:
+            try:
+                decoded_pils = self._build_continue_context_decoded(ctx)
+                self._display_continue_context(
+                    decoded_pils, desc + "  [VAE decoded view]",
+                    padding_flags=padding_flags)
+                return
+            except Exception as e:
+                self.log_rectified(f"Context decode error: {e}")
+
+        # Fallback: raw source bitmaps (VAE not loaded)
+        self._display_continue_context(
+            ctx, desc + "  [source — load VAE for decoded view]",
+            padding_flags=padding_flags)
+
+    def _build_continue_context_decoded(self, context_pils):
+        """Encode the exact context tensor → decode back → return list[PIL].
+
+        Uses the same normalization / padding as `_build_continue_context_latent`
+        and the training dataset, so the output is literally what the model
+        receives (modulo the VAE reconstruction error).
+        """
+        img_size = self.global_settings['img_size'].get()
+        color_mode = self.global_settings['color_mode'].get()
+        in_ch = 3 if color_mode == 'rgb' else 1
+
+        tf = transforms.Compose([
+            transforms.Resize((img_size, img_size)),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5,) * in_ch, (0.5,) * in_ch),
+        ])
+
+        tensors = []
+        for pil in context_pils:
+            if pil is None:
+                tensors.append(torch.zeros(in_ch, img_size, img_size))
+            else:
+                pil_norm = pil.convert('RGB') if color_mode == 'rgb' else pil.convert('L')
+                tensors.append(tf(pil_norm))
+
+        stacked = torch.stack(tensors, dim=0)  # [history, C, H, W]
+
+        with torch.no_grad():
+            z = self.vae_model.encode(stacked)
+            decoded = self.vae_model.decode(z, target_size=(img_size, img_size))
+
+        decoded_np = ((decoded + 1) / 2).clamp(0, 1).cpu().numpy()
+        pils = []
+        for i in range(decoded.shape[0]):
+            arr = decoded_np[i]
+            if arr.shape[0] == 1:
+                im = np.stack([arr[0] * 255] * 3, axis=-1).astype(np.uint8)
+            else:
+                im = (arr.transpose(1, 2, 0) * 255).astype(np.uint8)
+            pils.append(Image.fromarray(im))
+        return pils
+
+    def _display_continue_context(self, context_pils, desc, padding_flags=None):
         thumb = 96
         n = max(1, len(context_pils))
         grid = Image.new('RGB', (n * thumb, thumb), color=(50, 50, 50))
         for i, pil in enumerate(context_pils):
             if pil is None:
                 img = Image.new('RGB', (thumb, thumb), (0, 0, 0))
+                is_pad = True
             else:
                 img = pil.convert('RGB').resize((thumb, thumb), Image.NEAREST)
+                is_pad = padding_flags[i] if padding_flags else False
+            if is_pad:
+                draw = ImageDraw.Draw(img)
+                draw.rectangle([0, 0, thumb - 1, thumb - 1],
+                               outline=(255, 100, 100), width=2)
+                draw.text((4, 4), "PAD", fill=(255, 220, 220))
             grid.paste(img, (i * thumb, 0))
         photo = ImageTk.PhotoImage(grid)
         self.continue_context_canvas.delete("all")
@@ -853,28 +944,6 @@ class RectifiedFlowApp:
         self.continue_context_canvas.create_image(0, 0, image=photo, anchor='nw')
         self.continue_context_photo = photo
         self.continue_info.config(text=desc)
-
-    def _display_continue_generated(self, decoded_tensor, status_msg=""):
-        """decoded_tensor: [T, C, H, W] in [-1, 1]."""
-        thumb = 96
-        T = decoded_tensor.shape[0]
-        decoded_np = ((decoded_tensor + 1) / 2).clamp(0, 1).cpu().numpy()
-        grid = Image.new('RGB', (max(1, T) * thumb, thumb), color=(80, 80, 80))
-        for fi in range(T):
-            arr = decoded_np[fi]
-            if arr.shape[0] == 1:
-                im = np.stack([arr[0] * 255] * 3, axis=-1).astype(np.uint8)
-            else:
-                im = (arr.transpose(1, 2, 0) * 255).astype(np.uint8)
-            pil = Image.fromarray(im).resize((thumb, thumb), Image.NEAREST)
-            grid.paste(pil, (fi * thumb, 0))
-        photo = ImageTk.PhotoImage(grid)
-        self.continue_gen_canvas.delete("all")
-        self.continue_gen_canvas.config(width=grid.width, height=grid.height)
-        self.continue_gen_canvas.create_image(0, 0, image=photo, anchor='nw')
-        self.continue_gen_photo = photo
-        if status_msg:
-            self.continue_info.config(text=status_msg)
 
     def _build_continue_context_latent(self, context_pils):
         """context_pils: list of PIL or None. Returns [1, history, C, h, w]."""
@@ -891,17 +960,111 @@ class RectifiedFlowApp:
         tensors = []
         for pil in context_pils:
             if pil is None:
-                # Match training-time zero padding
                 tensors.append(torch.zeros(in_ch, img_size, img_size))
             else:
                 pil_norm = pil.convert('RGB') if color_mode == 'rgb' else pil.convert('L')
                 tensors.append(tf(pil_norm))
 
-        stacked = torch.stack(tensors, dim=0)  # [history, C, H, W]
+        stacked = torch.stack(tensors, dim=0)
         with torch.no_grad():
-            z = self.vae_model.encode(stacked)  # [history, C_latent, h, w]
-        return z.unsqueeze(0).to(self.rectified_model.device)  # [1, history, ...]
+            z = self.vae_model.encode(stacked)
+        return z.unsqueeze(0).to(self.rectified_model.device)
 
+    # ---------------- Continue playback ----------------
+    def _continue_start_playback(self):
+        if not self.continue_gen_frames_pil:
+            return
+        self._continue_pause_playback()
+        self.continue_playback_active = True
+        self.continue_playback_idx = 0
+        self.continue_play_btn.config(state=tk.DISABLED)
+        self.continue_pause_btn.config(state=tk.NORMAL)
+        self._continue_playback_tick()
+
+    def _continue_pause_playback(self):
+        self.continue_playback_active = False
+        if self.continue_playback_after_id is not None:
+            try:
+                self.root.after_cancel(self.continue_playback_after_id)
+            except Exception:
+                pass
+            self.continue_playback_after_id = None
+        if self.continue_gen_frames_pil:
+            self.continue_play_btn.config(state=tk.NORMAL)
+        self.continue_pause_btn.config(state=tk.DISABLED)
+
+    def _continue_playback_tick(self):
+        if not self.continue_playback_active or not self.continue_gen_frames_pil:
+            return
+        fi = self.continue_playback_idx % len(self.continue_gen_frames_pil)
+        self._show_continue_frame(fi)
+        self.continue_playback_idx += 1
+        fps = max(1, int(self.playback_fps.get()))
+        self.continue_playback_after_id = self.root.after(
+            int(1000 / fps), self._continue_playback_tick)
+
+    def _show_continue_frame(self, fi):
+        if not self.continue_gen_frames_pil:
+            return
+        fi = fi % len(self.continue_gen_frames_pil)
+        pil = self.continue_gen_frames_pil[fi]
+        display = 256
+        pil_disp = pil.convert('RGB').resize((display, display), Image.NEAREST)
+        photo = ImageTk.PhotoImage(pil_disp)
+        self.continue_gen_canvas.delete("all")
+        self.continue_gen_canvas.config(width=display, height=display)
+        self.continue_gen_canvas.create_image(0, 0, image=photo, anchor='nw')
+        self.continue_gen_photo = photo
+        self.continue_info.config(
+            text=f"Playing frame {fi + 1}/{len(self.continue_gen_frames_pil)}")
+
+    def _continue_show_strip(self):
+        """Stop playback and display all generated frames as a strip."""
+        self._continue_pause_playback()
+        if not self.continue_gen_frames_pil:
+            return
+        grid = self._render_strip_from_pils(self.continue_gen_frames_pil)
+        photo = ImageTk.PhotoImage(grid)
+        self.continue_gen_canvas.delete("all")
+        self.continue_gen_canvas.config(width=grid.width, height=grid.height)
+        self.continue_gen_canvas.create_image(0, 0, image=photo, anchor='nw')
+        self.continue_gen_photo = photo
+        self.continue_info.config(
+            text=f"All {len(self.continue_gen_frames_pil)} generated frames")
+
+    def _render_strip_from_pils(self, pils):
+        thumb = 96
+        T = len(pils)
+        grid = Image.new('RGB', (max(1, T) * thumb, thumb), color=(80, 80, 80))
+        for fi, pil in enumerate(pils):
+            grid.paste(pil.convert('RGB').resize((thumb, thumb), Image.NEAREST),
+                       (fi * thumb, 0))
+        return grid
+
+    def _continue_finalize(self, decoded_tensor):
+        """Store decoded frames as PILs, enable playback controls, auto-play."""
+        decoded_np = ((decoded_tensor + 1) / 2).clamp(0, 1).cpu().numpy()
+        pils = []
+        for fi in range(decoded_np.shape[0]):
+            arr = decoded_np[fi]
+            if arr.shape[0] == 1:
+                im = np.stack([arr[0] * 255] * 3, axis=-1).astype(np.uint8)
+            else:
+                im = (arr.transpose(1, 2, 0) * 255).astype(np.uint8)
+            pils.append(Image.fromarray(im))
+        self.continue_gen_frames_pil = pils
+
+        # Show strip first so the paused view is the full comparison
+        self._continue_show_strip()
+
+        self.continue_play_btn.config(state=tk.NORMAL)
+        self.continue_pause_btn.config(state=tk.NORMAL)
+        self.continue_show_all_btn.config(state=tk.NORMAL)
+
+        # Auto-play like the Generation tab
+        self._continue_start_playback()
+
+    # ---------------- Continue generation ----------------
     def continue_stop(self):
         self.continue_stop_flag = True
         self.continue_stop_btn.config(state=tk.DISABLED)
@@ -918,6 +1081,13 @@ class RectifiedFlowApp:
         if context_pils is None:
             self.continue_info.config(text=desc)
             return
+
+        # Reset playback state for the new run
+        self._continue_pause_playback()
+        self.continue_gen_frames_pil = []
+        self.continue_play_btn.config(state=tk.DISABLED)
+        self.continue_pause_btn.config(state=tk.DISABLED)
+        self.continue_show_all_btn.config(state=tk.DISABLED)
 
         num_frames = int(self.continue_num_frames.get())
         steps = int(self.continue_steps.get())
@@ -960,8 +1130,9 @@ class RectifiedFlowApp:
 
     def _continue_generate_thread(self, context_latent, cond, num_frames, steps,
                                     method, cfg_scale, use_ema, progressive, interval):
+        final_decoded = None
+        img_size = self.global_settings['img_size'].get()
         try:
-            img_size = self.global_settings['img_size'].get()
             if progressive:
                 for fi, si, frames_z in self.rectified_model.sample_video_step_by_step(
                         n_samples=1, num_frames=num_frames, cond=cond,
@@ -971,37 +1142,33 @@ class RectifiedFlowApp:
                         break
                     if si % interval != 0 and si != steps:
                         continue
-                    all_z = torch.cat(frames_z, dim=0)  # [T_so_far, C, h, w]
+                    all_z = torch.cat(frames_z, dim=0)
                     with torch.no_grad():
                         decoded = self.vae_model.decode(
                             all_z.cpu(), target_size=(img_size, img_size))
+                    final_decoded = decoded
                     self.root.after(
                         0, lambda d=decoded, f=fi, s=si:
-                        self._display_continue_generated(
-                            d, f"Frame {f + 1}/{num_frames}, step {s}/{steps}"))
+                        self._continue_show_progressive(d, f, s, num_frames, steps))
             else:
                 z_vid = self.rectified_model.sample_video(
                     n_samples=1, num_frames=num_frames, cond=cond,
                     steps=steps, method=method, cfg_scale=cfg_scale,
                     use_ema=use_ema, init_context=context_latent,
                     stop_check=lambda: self.continue_stop_flag)
-                if z_vid is None:
-                    self.root.after(0, lambda: self.continue_info.config(text="Stopped."))
-                    return
-                T, C, h, w = z_vid.shape[1:]
-                flat = z_vid.reshape(T, C, h, w)
-                with torch.no_grad():
-                    decoded = self.vae_model.decode(
-                        flat.cpu(), target_size=(img_size, img_size))
-                self.root.after(
-                    0, lambda d=decoded:
-                    self._display_continue_generated(
-                        d, f"Done. {num_frames} frames generated."))
+                if z_vid is not None:
+                    T, C, h, w = z_vid.shape[1:]
+                    flat = z_vid.reshape(T, C, h, w)
+                    with torch.no_grad():
+                        decoded = self.vae_model.decode(
+                            flat.cpu(), target_size=(img_size, img_size))
+                    final_decoded = decoded
 
-            if self.continue_stop_flag:
-                self.root.after(0, lambda: self.continue_info.config(text="Stopped."))
-            else:
+            if (not self.continue_stop_flag) and final_decoded is not None:
+                self.root.after(0, lambda d=final_decoded: self._continue_finalize(d))
                 self.root.after(0, lambda: self.continue_info.config(text="Complete."))
+            else:
+                self.root.after(0, lambda: self.continue_info.config(text="Stopped."))
         except Exception as e:
             import traceback; traceback.print_exc()
             self.root.after(0, lambda: self.continue_info.config(text=f"Error: {e}"))
@@ -1009,6 +1176,26 @@ class RectifiedFlowApp:
             self.continue_in_progress = False
             self.root.after(0, lambda: self.continue_generate_btn.config(state=tk.NORMAL))
             self.root.after(0, lambda: self.continue_stop_btn.config(state=tk.DISABLED))
+
+    def _continue_show_progressive(self, decoded, fi, si, num_frames, total_steps):
+        """Show the current progressive state as a strip (like the old path)."""
+        decoded_np = ((decoded + 1) / 2).clamp(0, 1).cpu().numpy()
+        pils = []
+        for i in range(decoded_np.shape[0]):
+            arr = decoded_np[i]
+            if arr.shape[0] == 1:
+                im = np.stack([arr[0] * 255] * 3, axis=-1).astype(np.uint8)
+            else:
+                im = (arr.transpose(1, 2, 0) * 255).astype(np.uint8)
+            pils.append(Image.fromarray(im))
+        grid = self._render_strip_from_pils(pils)
+        photo = ImageTk.PhotoImage(grid)
+        self.continue_gen_canvas.delete("all")
+        self.continue_gen_canvas.config(width=grid.width, height=grid.height)
+        self.continue_gen_canvas.create_image(0, 0, image=photo, anchor='nw')
+        self.continue_gen_photo = photo
+        self.continue_info.config(
+            text=f"Frame {fi + 1}/{num_frames}, step {si}/{total_steps}")
 
     # ---------------- Logging ----------------
     def log_vae(self, msg):
@@ -1378,6 +1565,8 @@ class RectifiedFlowApp:
             self.vae_model.load_state_dict(ckpt['model_state'])
             self.vae_optimizer.load_state_dict(ckpt['optimizer_state'])
             self.log_vae(f"VAE loaded from {fname}")
+            # Refresh context preview now that we can decode
+            self._continue_refresh_context_preview()
         except Exception as e:
             self.log_vae(f"Load error: {e}")
 
@@ -1693,7 +1882,6 @@ class RectifiedFlowApp:
                 except Exception:
                     pass
 
-            # Restore aug settings if present (newer checkpoints)
             if 'aug_settings' in ckpt:
                 for k, v in ckpt['aug_settings'].items():
                     if k in self.flow_aug_settings:
