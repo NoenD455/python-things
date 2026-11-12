@@ -13,7 +13,8 @@ Reuses from flow_api:
   Conv2dWithPadding, AttentionBlock, DownBlock, UpBlock,
   SinusoidalPositionEmbeddings, get_norm, TextEncoder, TransformerTextEncoder,
   get_encoder_config, text_to_indices, load_image_as_rgb/grayscale,
-  match_ot_batch, RandomJPEG, ElasticTransform, compute_head_dims.
+  match_ot_batch, RandomJPEG, ElasticTransform, PaddedTransform,
+  TV_ROT_HAS_PAD, TV_PERSP_HAS_PAD, compute_head_dims.
 
 Reuses from LDM_api:
   FlexVAE (identical to the image-LDM VAE).
@@ -35,7 +36,9 @@ from flow_api import (
     SinusoidalPositionEmbeddings, get_norm,
     TextEncoder, TransformerTextEncoder, get_encoder_config,
     text_to_indices, load_image_as_rgb, load_image_as_grayscale,
-    match_ot_batch, RandomJPEG, ElasticTransform, compute_head_dims,
+    match_ot_batch, RandomJPEG, ElasticTransform,
+    PaddedTransform, TV_ROT_HAS_PAD, TV_PERSP_HAS_PAD,
+    compute_head_dims,
 )
 from LDM_api import FlexVAE  # VAE is shared with the image LDM
 
@@ -64,7 +67,6 @@ def load_video_frames(path, stride=1):
     ext = os.path.splitext(path)[1].lower()
     frames = []
 
-    # GIF: PIL handles natively
     if ext == '.gif':
         img = Image.open(path)
         i = 0
@@ -78,7 +80,6 @@ def load_video_frames(path, stride=1):
             pass
         return frames
 
-    # Try OpenCV
     if _HAS_CV2:
         import cv2
         cap = cv2.VideoCapture(path)
@@ -93,7 +94,6 @@ def load_video_frames(path, stride=1):
         cap.release()
         return frames
 
-    # Try imageio
     if _HAS_IMAGEIO:
         for i, frame in enumerate(_iio.imiter(path)):
             if i % stride == 0:
@@ -119,17 +119,6 @@ class VelocityUNet(nn.Module):
     """UNet that accepts [B, C*(1+history), H, W] where the first C channels
     are the noisy latent for the current frame, and the rest are the history
     context latents (oldest → newest). Outputs [B, C, H, W] velocity.
-
-    Attention is configurable per-resolution (like the image LDM):
-      attention_levels[0] → block at the highest spatial resolution
-      attention_levels[1] → next level down (if any)
-      attention_levels[2] → lowest level / mid block
-
-    Conditioning mode is one of:
-      'shift'      → additive conditioning  (legacy default)
-      'film'       → scale + shift conditioning
-      'adagn'      → adaptive GroupNorm
-      'cross_attn' → cross-attention with cond as KV
     """
     def __init__(self, latent_channels=8, history=1, base_channels=32,
                  time_emb_dim=128, cond_dim=256,
@@ -267,7 +256,6 @@ class RectifiedFlowLatent:
         self.ot_sinkhorn_eps = 0.05
         self.ot_sinkhorn_iters = 50
 
-        # remember for EMA clone
         self._attn_kwargs = dict(
             attention_levels=attention_levels,
             attn_num_heads=attn_num_heads,
@@ -321,10 +309,6 @@ class RectifiedFlowLatent:
 
     def train_step(self, z0, z1, cond=None, context=None, cfg_dropout_prob=0.0,
                    noise_ctx_prob=0.0, noise_ctx_scale=0.5):
-        """z0: [B, C, H, W] noise
-           z1: [B, C, H, W] target latent
-           context: [B, history, C, H, W] history latents or None
-        """
         self.model.train()
         B = z0.size(0)
         z0 = z0.to(self.device); z1 = z1.to(self.device)
@@ -348,7 +332,6 @@ class RectifiedFlowLatent:
             mask = (torch.rand(B, 1, device=self.device) > cfg_dropout_prob).float()
             cond = cond * mask
 
-        # noise-ctx augmentation (flow-only, latent space)
         if context is not None and self.history > 0:
             context = context.to(self.device)
             if noise_ctx_prob > 0:
@@ -407,7 +390,6 @@ class RectifiedFlowLatent:
     @torch.no_grad()
     def sample_frame(self, n_samples=16, cond=None, steps=50, method='euler',
                      cfg_scale=1.0, use_ema=True, start_from=None, context=None):
-        """Sample ONE frame. context: [n, history, C, H, W] or None."""
         model = (self.ema_model
                  if (use_ema and self.use_ema and self.ema_model is not None)
                  else self.model)
@@ -434,9 +416,6 @@ class RectifiedFlowLatent:
     def sample_video(self, n_samples=1, num_frames=16, cond=None, steps=50,
                      method='euler', cfg_scale=1.0, use_ema=True,
                      init_context=None, progress_cb=None, stop_check=None):
-        """Autoregressively generate `num_frames` frames per sample.
-           Returns [n_samples, num_frames, C, H, W] or None if stopped
-           before the first frame completes."""
         B = n_samples
         if init_context is not None:
             context = init_context.to(self.device)
@@ -465,18 +444,6 @@ class RectifiedFlowLatent:
     def sample_video_step_by_step(self, n_samples=1, num_frames=16, cond=None,
                                   steps=50, method='euler', cfg_scale=1.0,
                                   use_ema=True, init_context=None):
-        """Generator version for progressive preview.
-
-        Yields ``(frame_idx, step_in_frame, frames_z)`` after every ODE step:
-          - ``frame_idx``     : 0-indexed frame currently being generated
-          - ``step_in_frame`` : 1..steps
-          - ``frames_z``      : list of all frames generated so far;
-                                ``frames_z[-1]`` is the current in-progress
-                                frame, ``frames_z[:-1]`` are completed frames.
-
-        All yielded tensors are cloned, so the caller is free to process them
-        asynchronously (e.g. hand off to the Tk main thread).
-        """
         B = n_samples
         model = (self.ema_model
                  if (use_ema and self.use_ema and self.ema_model is not None)
@@ -543,10 +510,13 @@ class VideoFrameDataset(Dataset):
                 transforms.Normalize((0.5,), (0.5,))
             ])
 
+        self.aug_padding_mode = self.aug_settings.get('aug_padding_mode', 'edge')
+        if self.aug_padding_mode not in ('constant', 'edge', 'reflect', 'symmetric'):
+            self.aug_padding_mode = 'edge'
         self.aug_pipeline = self._build_aug_pipeline(self.aug_settings)
 
-        self.source_frames = []   # list of [PIL, PIL, ...]
-        self.samples = []         # (source_idx, start, label_list)
+        self.source_frames = []
+        self.samples = []
         for i, src in enumerate(sources):
             frames = self._load_source_frames(src)
             self.source_frames.append(frames)
@@ -558,40 +528,78 @@ class VideoFrameDataset(Dataset):
                 self.samples.append((i, start, lbl))
 
     def _build_aug_pipeline(self, a):
+        """Augmentation pipeline with configurable padding mode.
+
+        Rotation / perspective use native `padding_mode=` when torchvision
+        supports it (TV_ROT_HAS_PAD / TV_PERSP_HAS_PAD); otherwise we emulate
+        it with PaddedTransform (pad → apply → center-crop). ElasticTransform
+        always receives `padding_mode`.
+        """
+        aug_pad = self.aug_padding_mode
         pipeline = []
+
         if a.get('flip_horizontal', False):
             pipeline.append(transforms.RandomHorizontalFlip(p=0.5))
+
+        # --- Rotation (±30°) with padding_mode ---
         if a.get('rotation', False):
-            pipeline.append(transforms.RandomRotation(
-                30, interpolation=Image.BICUBIC, expand=False, fill=0))
+            if TV_ROT_HAS_PAD:
+                pipeline.append(transforms.RandomRotation(
+                    30, interpolation=Image.BICUBIC, expand=False, fill=0,
+                    padding_mode=aug_pad))
+            else:
+                base = transforms.RandomRotation(
+                    30, interpolation=Image.BICUBIC, expand=False, fill=0)
+                pipeline.append(PaddedTransform(
+                    base, pad_fraction=0.22, padding_mode=aug_pad))
+
         if a.get('random_crop', False):
             sc = a.get('crop_scale', 0.8)
             pipeline.append(transforms.RandomResizedCrop(
                 size=self.img_size, scale=(sc, 1.0), interpolation=Image.BICUBIC))
+
         if a.get('color_jitter', False):
             pipeline.append(transforms.ColorJitter(
                 brightness=a.get('brightness', 0.2), contrast=a.get('contrast', 0.2),
                 saturation=a.get('saturation', 0.2), hue=a.get('hue', 0.1)))
+
+        # --- Perspective with padding_mode ---
         if a.get('random_perspective', False):
-            pipeline.append(transforms.RandomPerspective(
-                distortion_scale=a.get('perspective_distortion', 0.1),
-                p=0.5, interpolation=Image.BICUBIC, fill=0))
+            dist = float(a.get('perspective_distortion', 0.1))
+            if TV_PERSP_HAS_PAD:
+                pipeline.append(transforms.RandomPerspective(
+                    distortion_scale=dist, p=0.5,
+                    interpolation=Image.BICUBIC, fill=0,
+                    padding_mode=aug_pad))
+            else:
+                base = transforms.RandomPerspective(
+                    distortion_scale=dist, p=0.5,
+                    interpolation=Image.BICUBIC, fill=0)
+                frac = min(0.35, max(0.20, dist * 0.5 + 0.15))
+                pipeline.append(PaddedTransform(
+                    base, pad_fraction=frac, padding_mode=aug_pad))
+
         if a.get('elastic_transform', False):
             pipeline.append(ElasticTransform(
                 alpha=a.get('elastic_alpha', 30),
-                sigma=a.get('elastic_sigma', 3), p=0.5))
+                sigma=a.get('elastic_sigma', 3), p=0.5,
+                padding_mode=aug_pad))
+
         if a.get('jpeg_compression', False):
             pipeline.append(RandomJPEG(
                 quality_low=a.get('jpeg_quality_low', 50),
                 quality_high=a.get('jpeg_quality_high', 95), p=0.5))
+
         if a.get('stretch_vertical', False):
             pipeline.append(transforms.RandomResizedCrop(
                 size=self.img_size, scale=(0.8, 1.0), ratio=(0.5, 1.0),
                 interpolation=Image.BICUBIC))
+
         if a.get('stretch_horizontal', False):
             pipeline.append(transforms.RandomResizedCrop(
                 size=self.img_size, scale=(0.8, 1.0), ratio=(1.0, 2.0),
                 interpolation=Image.BICUBIC))
+
         return pipeline
 
     def _load_source_frames(self, src):

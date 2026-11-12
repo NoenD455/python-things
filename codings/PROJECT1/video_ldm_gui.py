@@ -3,20 +3,22 @@
 Video Latent Rectified Flow — Tkinter GUI.
 
 Tabs: Dataset | VAE Settings | VAE Training | Flow Settings | Flow Training |
-      Augmentation Settings | Generation
+      Augmentation Settings | Generation | Continue
 
-New in this version (matching the image LDM):
+New in this version:
   * Per-level attention toggles (L0/L1/L2), attn_num_heads, attn_dropout
-    + live head-dim label
   * Conditioning mode selector (shift / film / adagn / cross_attn)
+  * Augmentation padding mode (edge / reflect / symmetric / constant)
+  * New Continue tab: generate continuation from an image or a video frame
+    (supports negative frame indices; respects the model's history context)
   * Generation tab: Stop button + Progressive preview + Update-interval
-  * Stop works mid-ODE-step in progressive mode, between frames otherwise
 """
 import tkinter as tk
 from tkinter import filedialog, ttk, messagebox
 import torch
 import torch.optim as optim
 import torch.nn.functional as F_nn
+import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
 from PIL import Image, ImageTk
 import os
@@ -61,6 +63,7 @@ def default_aug_dict():
         'jpeg_quality_high': tk.IntVar(value=95),
         'stretch_vertical': tk.BooleanVar(value=False),
         'stretch_horizontal': tk.BooleanVar(value=False),
+        'aug_padding_mode': tk.StringVar(value='edge'),
     }
 
 
@@ -71,6 +74,7 @@ AUG_DEFAULTS = {
     'elastic_transform': False, 'elastic_alpha': 30, 'elastic_sigma': 3,
     'jpeg_compression': False, 'jpeg_quality_low': 50, 'jpeg_quality_high': 95,
     'stretch_vertical': False, 'stretch_horizontal': False,
+    'aug_padding_mode': 'edge',
     # Flow-only
     'noise_ctx_enabled': False, 'noise_ctx_prob': 0.1, 'noise_ctx_scale': 0.5,
 }
@@ -130,7 +134,6 @@ class RectifiedFlowApp:
             'vae_kl_weight': tk.DoubleVar(value=0.0001),
         }
 
-        # ---- Flow settings (per-level attention + cond_mode like image LDM) ----
         self.flow_settings = {
             'flow_base_channels': tk.IntVar(value=32),
             'flow_padding_mode': tk.StringVar(value='constant'),
@@ -140,7 +143,6 @@ class RectifiedFlowApp:
             'flow_cfg_dropout': tk.DoubleVar(value=0.1),
             'flow_use_ot': tk.BooleanVar(value=False),
 
-            # Per-level attention (matches image LDM)
             'attn_level_0': tk.BooleanVar(value=True),
             'attn_level_1': tk.BooleanVar(value=True),
             'attn_level_2': tk.BooleanVar(value=True),
@@ -165,7 +167,6 @@ class RectifiedFlowApp:
             'cond_ff_dim': tk.IntVar(value=256),
             'cond_dim': tk.IntVar(value=256),
             'cond_text_max_len': tk.IntVar(value=128),
-            # NEW: conditioning mode (shift / film / adagn / cross_attn)
             'cond_mode': tk.StringVar(value='shift'),
         }
 
@@ -180,10 +181,8 @@ class RectifiedFlowApp:
         self.cfg_scale = tk.DoubleVar(value=2.0)
         self.thumbnail_size = 128
 
-        # Live head-dim label
         self.flow_head_dim_var = tk.StringVar(value="—")
 
-        # Video generation / playback state
         self.playback_fps = tk.IntVar(value=10)
         self.playback_active = False
         self.playback_idx = 0
@@ -193,10 +192,27 @@ class RectifiedFlowApp:
         self._anim_photo = None
         self.frame_stride = tk.IntVar(value=1)
 
-        # Generation control
         self.gen_stop_flag = False
         self.progressive_preview = tk.BooleanVar(value=False)
         self.prog_interval = tk.IntVar(value=10)
+
+        # ---- Continue tab state ----
+        self.continue_mode = tk.StringVar(value='image')  # 'image' | 'video'
+        self.continue_image_path = None
+        self.continue_video_path = None
+        self.continue_video_frames = []
+        self.continue_frame_index = tk.IntVar(value=-1)
+        self.continue_num_frames = tk.IntVar(value=8)
+        self.continue_steps = tk.IntVar(value=50)
+        self.continue_method = tk.StringVar(value='euler')
+        self.continue_cfg = tk.DoubleVar(value=2.0)
+        self.continue_prompt = tk.StringVar(value="")
+        self.continue_progressive = tk.BooleanVar(value=True)
+        self.continue_prog_interval = tk.IntVar(value=10)
+        self.continue_stop_flag = False
+        self.continue_in_progress = False
+        self.continue_context_photo = None
+        self.continue_gen_photo = None
 
         self.setup_gui()
         self.root.after(100, self.process_messages_vae)
@@ -214,6 +230,7 @@ class RectifiedFlowApp:
             ('Flow Training',        self.setup_flow_training_tab),
             ('Augmentation Settings',self.setup_augmentation_tab),
             ('Generation',           self.setup_generation_tab),
+            ('Continue',             self.setup_continue_tab),
         ]
         for name, builder in tabs:
             frame = ttk.Frame(self.notebook)
@@ -357,14 +374,14 @@ class RectifiedFlowApp:
         wrap = tk.Frame(inner); wrap.pack(fill=tk.X, padx=20, pady=20)
         tk.Label(wrap, text="Flow Settings", font=("Arial", 14, "bold")).pack(pady=(0, 15))
 
-        # --- Flow UNet ---
         uf = tk.LabelFrame(wrap, text="Flow UNet", padx=10, pady=10); uf.pack(fill=tk.X, pady=5)
         self._spin(uf, "Base channels:", self.flow_settings['flow_base_channels'], 4, 256)
         self._spin(uf, "History frames (1–10):", self.flow_settings['flow_history'], 1, 10)
-        self._combo(uf, "Padding mode:", self.flow_settings['flow_padding_mode'],
+        self._combo(uf, "UNet padding mode:", self.flow_settings['flow_padding_mode'],
                     ['constant', 'reflect', 'replicate', 'circular'])
+        tk.Label(uf, text="(conv padding — distinct from augmentation padding below)",
+                 fg='gray', font=("Arial", 8, "italic")).pack(anchor='w')
 
-        # --- Per-level attention ---
         af = tk.LabelFrame(uf, text="Attention (per resolution)", padx=6, pady=6)
         af.pack(fill=tk.X, pady=(8, 2))
         f = tk.Frame(af); f.pack(fill=tk.X, pady=2)
@@ -385,7 +402,6 @@ class RectifiedFlowApp:
         self.flow_settings['flow_base_channels'].trace_add('write', lambda *_: self._refresh_flow_head_dims())
         self._refresh_flow_head_dims()
 
-        # --- Flow training ---
         tf = tk.LabelFrame(wrap, text="Flow Training", padx=10, pady=10); tf.pack(fill=tk.X, pady=5)
         self._spin(tf, "Batch size:", self.flow_settings['flow_batch_size'], 1, 64)
         self._entry(tf, "Learning rate:", self.flow_settings['flow_lr'])
@@ -393,14 +409,12 @@ class RectifiedFlowApp:
         tk.Checkbutton(tf, text="Use OT matching",
                        variable=self.flow_settings['flow_use_ot']).pack(anchor='w')
 
-        # --- EMA ---
         ef = tk.LabelFrame(wrap, text="EMA", padx=10, pady=10); ef.pack(fill=tk.X, pady=5)
         tk.Checkbutton(ef, text="Enable EMA",
                        variable=self.flow_settings['ema_enabled']).pack(anchor='w')
         self._entry(ef, "Decay:", self.flow_settings['ema_decay'])
         self._combo(ef, "Mode:", self.flow_settings['ema_mode'], ['standard', 'lookahead'])
 
-        # --- Preview during training ---
         pvf = tk.LabelFrame(wrap, text="Preview During Training", padx=10, pady=10); pvf.pack(fill=tk.X, pady=5)
         tk.Checkbutton(pvf, text="Enable preview",
                        variable=self.flow_settings['preview_enabled']).pack(anchor='w')
@@ -410,7 +424,6 @@ class RectifiedFlowApp:
         self._combo(pvf, "ODE method:", self.flow_settings['preview_method'],
                     ['euler', 'heun', 'midpoint', 'rk4'])
 
-        # --- Text conditioning ---
         cf = tk.LabelFrame(wrap, text="Text Conditioning", padx=10, pady=10); cf.pack(fill=tk.X, pady=5)
         tk.Checkbutton(cf, text="Enable text conditioning",
                        variable=self.flow_settings['cond_enabled']).pack(anchor='w')
@@ -418,7 +431,6 @@ class RectifiedFlowApp:
                     ['BiGRU', 'BiTransformer'])
         self._combo(cf, "Encoder size:", self.flow_settings['text_encoder_size'],
                     ['tiny', 'small', 'medium', 'large'])
-        # NEW: cond_mode selector
         self._combo(cf, "Cond mode:", self.flow_settings['cond_mode'],
                     list(VALID_COND_MODES))
         tk.Label(cf, text="shift = additive · film = scale+shift · "
@@ -514,6 +526,17 @@ class RectifiedFlowApp:
     def _build_aug_controls(self, parent, aug, show_noise_ctx=False):
         def row():
             f = tk.Frame(parent); f.pack(fill=tk.X, pady=2); return f
+
+        # Aug padding mode (affects Rotation / Perspective / Elastic)
+        r = row()
+        tk.Label(r, text="Aug padding mode:").pack(side=tk.LEFT)
+        ttk.Combobox(r, textvariable=aug['aug_padding_mode'],
+                     values=['edge', 'reflect', 'symmetric', 'constant'],
+                     state='readonly', width=10).pack(side=tk.RIGHT)
+        tk.Label(parent,
+                 text="'edge' = replicate border pixel (recommended for video)",
+                 fg='gray', font=("Arial", 8, "italic")).pack(anchor='w')
+
         r = row(); tk.Checkbutton(r, text="Horizontal Flip", variable=aug['flip_horizontal']).pack(anchor='w')
         r = row(); tk.Checkbutton(r, text="Rotation (±30°)", variable=aug['rotation']).pack(anchor='w')
         r = row(); tk.Checkbutton(r, text="Random Crop", variable=aug['random_crop']).pack(side=tk.LEFT)
@@ -612,6 +635,380 @@ class RectifiedFlowApp:
         vs.pack(side=tk.RIGHT, fill=tk.Y); hs.pack(side=tk.BOTTOM, fill=tk.X)
         self.gen_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.gen_info = tk.Label(main, text="", fg="blue"); self.gen_info.pack()
+
+    # ---------------- Continue tab ----------------
+    def setup_continue_tab(self, tab):
+        main = tk.Frame(tab); main.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        tk.Label(main, text="Continue Generation — from Image or Video frame",
+                 font=("Arial", 12, "bold")).pack(pady=(0, 6))
+
+        # --- Source ---
+        src = tk.LabelFrame(main, text="Source", padx=8, pady=6)
+        src.pack(fill=tk.X, pady=4)
+
+        mode_row = tk.Frame(src); mode_row.pack(fill=tk.X, pady=2)
+        tk.Label(mode_row, text="Mode:", width=10, anchor='w').pack(side=tk.LEFT)
+        tk.Radiobutton(mode_row, text="From Image",
+                       variable=self.continue_mode, value='image',
+                       command=self._on_continue_mode_change).pack(side=tk.LEFT)
+        tk.Radiobutton(mode_row, text="From Video",
+                       variable=self.continue_mode, value='video',
+                       command=self._on_continue_mode_change).pack(side=tk.LEFT, padx=(10, 0))
+
+        load_row = tk.Frame(src); load_row.pack(fill=tk.X, pady=2)
+        tk.Button(load_row, text="Load Source",
+                  command=self.continue_load_source).pack(side=tk.LEFT)
+        tk.Button(load_row, text="Clear",
+                  command=self.continue_clear_source).pack(side=tk.LEFT, padx=4)
+        self.continue_path_label = tk.Label(load_row, text="(no source loaded)",
+                                            fg="gray", anchor='w')
+        self.continue_path_label.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
+
+        idx_row = tk.Frame(src); idx_row.pack(fill=tk.X, pady=2)
+        tk.Label(idx_row, text="Start frame index:", width=16, anchor='w').pack(side=tk.LEFT)
+        self.continue_idx_spin = tk.Spinbox(
+            idx_row, from_=-9999, to=9999,
+            textvariable=self.continue_frame_index, width=8,
+            command=self._continue_refresh_context_preview)
+        self.continue_idx_spin.pack(side=tk.LEFT)
+        tk.Label(idx_row, text=" (-1 = last frame, negative = from end)",
+                 fg='gray', font=("Arial", 8, "italic")).pack(side=tk.LEFT, padx=6)
+        tk.Button(idx_row, text="Refresh Preview",
+                  command=self._continue_refresh_context_preview).pack(side=tk.RIGHT)
+
+        # --- Preview ---
+        prev = tk.LabelFrame(main, text="Preview", padx=8, pady=6)
+        prev.pack(fill=tk.X, pady=4)
+        prev_row = tk.Frame(prev); prev_row.pack(fill=tk.X)
+
+        left = tk.Frame(prev_row); left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 4))
+        tk.Label(left, text="Context (history, what the model sees)").pack(anchor='w')
+        self.continue_context_canvas = tk.Canvas(left, bg='gray', width=384, height=100)
+        self.continue_context_canvas.pack(anchor='w')
+
+        right = tk.Frame(prev_row); right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(4, 0))
+        tk.Label(right, text="Generated (continuation)").pack(anchor='w')
+        self.continue_gen_canvas = tk.Canvas(right, bg='gray', width=768, height=100)
+        self.continue_gen_canvas.pack(anchor='w')
+
+        self.continue_info = tk.Label(main,
+                                      text="Load a source image or video to begin.",
+                                      fg="blue")
+        self.continue_info.pack(pady=2)
+
+        # --- Generation controls ---
+        gen = tk.LabelFrame(main, text="Generation", padx=8, pady=6)
+        gen.pack(fill=tk.X, pady=4)
+
+        prompt_row = tk.Frame(gen); prompt_row.pack(fill=tk.X, pady=2)
+        tk.Label(prompt_row, text="Prompt:").pack(side=tk.LEFT, padx=(2, 4))
+        tk.Entry(prompt_row, textvariable=self.continue_prompt, width=50).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=2)
+        tk.Label(prompt_row, text="(optional; used only if conditioning enabled)",
+                 fg='gray', font=("Arial", 8, "italic")).pack(side=tk.LEFT, padx=6)
+
+        ctrl_row = tk.Frame(gen); ctrl_row.pack(fill=tk.X, pady=2)
+        tk.Label(ctrl_row, text="Frames:").pack(side=tk.LEFT, padx=(2, 0))
+        tk.Spinbox(ctrl_row, from_=1, to=64, textvariable=self.continue_num_frames,
+                   width=4).pack(side=tk.LEFT, padx=2)
+        tk.Label(ctrl_row, text="Steps:").pack(side=tk.LEFT, padx=(8, 0))
+        tk.Spinbox(ctrl_row, from_=1, to=200, textvariable=self.continue_steps,
+                   width=4).pack(side=tk.LEFT, padx=2)
+        tk.Label(ctrl_row, text="Method:").pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Combobox(ctrl_row, textvariable=self.continue_method,
+                     values=['euler', 'heun', 'midpoint', 'rk4'],
+                     state='readonly', width=8).pack(side=tk.LEFT, padx=2)
+        tk.Label(ctrl_row, text="CFG:").pack(side=tk.LEFT, padx=(8, 0))
+        tk.Entry(ctrl_row, width=5, textvariable=self.continue_cfg).pack(side=tk.LEFT, padx=2)
+
+        prog_row = tk.Frame(gen); prog_row.pack(fill=tk.X, pady=2)
+        tk.Checkbutton(prog_row, text="Progressive preview",
+                       variable=self.continue_progressive).pack(side=tk.LEFT)
+        tk.Label(prog_row, text="Update every N steps:").pack(side=tk.LEFT, padx=(8, 0))
+        tk.Spinbox(prog_row, from_=1, to=100, textvariable=self.continue_prog_interval,
+                   width=4).pack(side=tk.LEFT, padx=2)
+        self.continue_generate_btn = tk.Button(prog_row, text="Generate",
+                                                command=self.continue_generate,
+                                                bg="lightgreen")
+        self.continue_generate_btn.pack(side=tk.LEFT, padx=(15, 4))
+        self.continue_stop_btn = tk.Button(prog_row, text="Stop",
+                                            command=self.continue_stop,
+                                            bg="salmon", state=tk.DISABLED)
+        self.continue_stop_btn.pack(side=tk.LEFT, padx=2)
+
+        self._on_continue_mode_change()
+
+    def _on_continue_mode_change(self):
+        if self.continue_mode.get() == 'video':
+            self.continue_idx_spin.config(state='normal')
+        else:
+            self.continue_idx_spin.config(state='disabled')
+
+    def continue_clear_source(self):
+        self.continue_image_path = None
+        self.continue_video_path = None
+        self.continue_video_frames = []
+        self.continue_path_label.config(text="(no source loaded)", fg="gray")
+        self.continue_context_canvas.delete("all")
+        self.continue_gen_canvas.delete("all")
+        self.continue_info.config(text="Source cleared.")
+
+    def continue_load_source(self):
+        if self.continue_mode.get() == 'image':
+            path = filedialog.askopenfilename(
+                filetypes=[("Images", "*.jpg *.jpeg *.png *.bmp *.jfif *.webp")])
+            if not path:
+                return
+            self.continue_image_path = path
+            self.continue_video_path = None
+            self.continue_video_frames = []
+            self.continue_path_label.config(text=os.path.basename(path), fg="black")
+        else:
+            path = filedialog.askopenfilename(
+                filetypes=[("Videos", "*.mp4 *.avi *.mov *.mkv *.webm *.gif *.m4v *.wmv *.flv"),
+                           ("All files", "*.*")])
+            if not path:
+                return
+            if not (_HAS_CV2 or _HAS_IMAGEIO):
+                messagebox.showerror("Video support missing",
+                                     "Install 'opencv-python' or 'imageio[ffmpeg]'.")
+                return
+            try:
+                frames = load_video_frames(path, stride=1)
+            except Exception as e:
+                self.continue_info.config(text=f"Video load error: {e}")
+                return
+            if not frames:
+                self.continue_info.config(text="No frames loaded from video.")
+                return
+            self.continue_video_path = path
+            self.continue_video_frames = frames
+            self.continue_image_path = None
+            self.continue_path_label.config(
+                text=f"{os.path.basename(path)} ({len(frames)} frames)", fg="black")
+
+        self._continue_refresh_context_preview()
+
+    def _continue_get_context_pils(self):
+        """Return (list_of_pils_or_None, description).
+
+        Length of list equals model `history`. None entries are zero-padding
+        slots (rendered black in the preview).
+        """
+        history = self.flow_settings['flow_history'].get()
+
+        if self.continue_mode.get() == 'image':
+            if not self.continue_image_path:
+                return None, "No image loaded"
+            try:
+                color_mode = self.global_settings['color_mode'].get()
+                if color_mode == 'rgb':
+                    img = load_image_as_rgb(self.continue_image_path)
+                else:
+                    img = load_image_as_grayscale(self.continue_image_path)
+            except Exception as e:
+                return None, f"Image load error: {e}"
+            ctx = [None] * (history - 1) + [img]
+            return ctx, (f"Image as last of {history} context slot(s) "
+                         f"({history - 1} padding)")
+        else:
+            if not self.continue_video_frames:
+                return None, "No video loaded"
+            T = len(self.continue_video_frames)
+            K = self.continue_frame_index.get()
+            if K < 0:
+                K = T + K
+            K = max(0, min(T - 1, K))
+            start = max(0, K - history + 1)
+            real_frames = self.continue_video_frames[start:K + 1]
+            pad_count = history - len(real_frames)
+            ctx = [None] * pad_count + list(real_frames)
+            desc = (f"Frames {start}..{K} "
+                    f"({len(real_frames)} real, {pad_count} padding)")
+            return ctx, desc
+
+    def _continue_refresh_context_preview(self):
+        ctx, desc = self._continue_get_context_pils()
+        if ctx is None:
+            self.continue_context_canvas.delete("all")
+            self.continue_context_canvas.create_text(
+                192, 50, text=desc, fill="white")
+            self.continue_info.config(text=desc)
+            return
+        self._display_continue_context(ctx, desc)
+
+    def _display_continue_context(self, context_pils, desc):
+        thumb = 96
+        n = max(1, len(context_pils))
+        grid = Image.new('RGB', (n * thumb, thumb), color=(50, 50, 50))
+        for i, pil in enumerate(context_pils):
+            if pil is None:
+                img = Image.new('RGB', (thumb, thumb), (0, 0, 0))
+            else:
+                img = pil.convert('RGB').resize((thumb, thumb), Image.NEAREST)
+            grid.paste(img, (i * thumb, 0))
+        photo = ImageTk.PhotoImage(grid)
+        self.continue_context_canvas.delete("all")
+        self.continue_context_canvas.config(width=grid.width, height=grid.height)
+        self.continue_context_canvas.create_image(0, 0, image=photo, anchor='nw')
+        self.continue_context_photo = photo
+        self.continue_info.config(text=desc)
+
+    def _display_continue_generated(self, decoded_tensor, status_msg=""):
+        """decoded_tensor: [T, C, H, W] in [-1, 1]."""
+        thumb = 96
+        T = decoded_tensor.shape[0]
+        decoded_np = ((decoded_tensor + 1) / 2).clamp(0, 1).cpu().numpy()
+        grid = Image.new('RGB', (max(1, T) * thumb, thumb), color=(80, 80, 80))
+        for fi in range(T):
+            arr = decoded_np[fi]
+            if arr.shape[0] == 1:
+                im = np.stack([arr[0] * 255] * 3, axis=-1).astype(np.uint8)
+            else:
+                im = (arr.transpose(1, 2, 0) * 255).astype(np.uint8)
+            pil = Image.fromarray(im).resize((thumb, thumb), Image.NEAREST)
+            grid.paste(pil, (fi * thumb, 0))
+        photo = ImageTk.PhotoImage(grid)
+        self.continue_gen_canvas.delete("all")
+        self.continue_gen_canvas.config(width=grid.width, height=grid.height)
+        self.continue_gen_canvas.create_image(0, 0, image=photo, anchor='nw')
+        self.continue_gen_photo = photo
+        if status_msg:
+            self.continue_info.config(text=status_msg)
+
+    def _build_continue_context_latent(self, context_pils):
+        """context_pils: list of PIL or None. Returns [1, history, C, h, w]."""
+        img_size = self.global_settings['img_size'].get()
+        color_mode = self.global_settings['color_mode'].get()
+        in_ch = 3 if color_mode == 'rgb' else 1
+
+        tf = transforms.Compose([
+            transforms.Resize((img_size, img_size)),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5,) * in_ch, (0.5,) * in_ch),
+        ])
+
+        tensors = []
+        for pil in context_pils:
+            if pil is None:
+                # Match training-time zero padding
+                tensors.append(torch.zeros(in_ch, img_size, img_size))
+            else:
+                pil_norm = pil.convert('RGB') if color_mode == 'rgb' else pil.convert('L')
+                tensors.append(tf(pil_norm))
+
+        stacked = torch.stack(tensors, dim=0)  # [history, C, H, W]
+        with torch.no_grad():
+            z = self.vae_model.encode(stacked)  # [history, C_latent, h, w]
+        return z.unsqueeze(0).to(self.rectified_model.device)  # [1, history, ...]
+
+    def continue_stop(self):
+        self.continue_stop_flag = True
+        self.continue_stop_btn.config(state=tk.DISABLED)
+        self.continue_info.config(text="Stopping...")
+
+    def continue_generate(self):
+        if not self.rectified_model or not self.vae_model:
+            self.continue_info.config(text="Load VAE + Flow model first!")
+            return
+        if self.continue_in_progress:
+            return
+
+        context_pils, desc = self._continue_get_context_pils()
+        if context_pils is None:
+            self.continue_info.config(text=desc)
+            return
+
+        num_frames = int(self.continue_num_frames.get())
+        steps = int(self.continue_steps.get())
+        method = self.continue_method.get()
+        cfg_scale = float(self.continue_cfg.get())
+        use_ema = self.flow_settings['ema_enabled'].get()
+        prompt = self.continue_prompt.get().strip()
+
+        cond = None
+        if (prompt and self.flow_settings['cond_enabled'].get()
+                and self.text_encoder is not None):
+            ti = text_to_indices(prompt, self.flow_settings['cond_text_max_len'].get())
+            tt = torch.tensor([ti], dtype=torch.long,
+                              device=self.rectified_model.device)
+            with torch.no_grad():
+                cond = self.text_encoder(tt)
+        else:
+            cfg_scale = 1.0
+
+        try:
+            context_latent = self._build_continue_context_latent(context_pils)
+        except Exception as e:
+            self.continue_info.config(text=f"Context encode error: {e}")
+            return
+
+        self.continue_stop_flag = False
+        self.continue_in_progress = True
+        self.continue_generate_btn.config(state=tk.DISABLED)
+        self.continue_stop_btn.config(state=tk.NORMAL)
+        self.continue_info.config(text="Generating...")
+
+        progressive = bool(self.continue_progressive.get())
+        interval = max(1, int(self.continue_prog_interval.get()))
+
+        threading.Thread(
+            target=self._continue_generate_thread,
+            args=(context_latent, cond, num_frames, steps, method, cfg_scale,
+                  use_ema, progressive, interval),
+            daemon=True).start()
+
+    def _continue_generate_thread(self, context_latent, cond, num_frames, steps,
+                                    method, cfg_scale, use_ema, progressive, interval):
+        try:
+            img_size = self.global_settings['img_size'].get()
+            if progressive:
+                for fi, si, frames_z in self.rectified_model.sample_video_step_by_step(
+                        n_samples=1, num_frames=num_frames, cond=cond,
+                        steps=steps, method=method, cfg_scale=cfg_scale,
+                        use_ema=use_ema, init_context=context_latent):
+                    if self.continue_stop_flag:
+                        break
+                    if si % interval != 0 and si != steps:
+                        continue
+                    all_z = torch.cat(frames_z, dim=0)  # [T_so_far, C, h, w]
+                    with torch.no_grad():
+                        decoded = self.vae_model.decode(
+                            all_z.cpu(), target_size=(img_size, img_size))
+                    self.root.after(
+                        0, lambda d=decoded, f=fi, s=si:
+                        self._display_continue_generated(
+                            d, f"Frame {f + 1}/{num_frames}, step {s}/{steps}"))
+            else:
+                z_vid = self.rectified_model.sample_video(
+                    n_samples=1, num_frames=num_frames, cond=cond,
+                    steps=steps, method=method, cfg_scale=cfg_scale,
+                    use_ema=use_ema, init_context=context_latent,
+                    stop_check=lambda: self.continue_stop_flag)
+                if z_vid is None:
+                    self.root.after(0, lambda: self.continue_info.config(text="Stopped."))
+                    return
+                T, C, h, w = z_vid.shape[1:]
+                flat = z_vid.reshape(T, C, h, w)
+                with torch.no_grad():
+                    decoded = self.vae_model.decode(
+                        flat.cpu(), target_size=(img_size, img_size))
+                self.root.after(
+                    0, lambda d=decoded:
+                    self._display_continue_generated(
+                        d, f"Done. {num_frames} frames generated."))
+
+            if self.continue_stop_flag:
+                self.root.after(0, lambda: self.continue_info.config(text="Stopped."))
+            else:
+                self.root.after(0, lambda: self.continue_info.config(text="Complete."))
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            self.root.after(0, lambda: self.continue_info.config(text=f"Error: {e}"))
+        finally:
+            self.continue_in_progress = False
+            self.root.after(0, lambda: self.continue_generate_btn.config(state=tk.NORMAL))
+            self.root.after(0, lambda: self.continue_stop_btn.config(state=tk.DISABLED))
 
     # ---------------- Logging ----------------
     def log_vae(self, msg):
@@ -1059,12 +1456,14 @@ class RectifiedFlowApp:
                 )
                 self.log_rectified(
                     f"Conditional Flow model initialized ({enc}, history={history}, "
-                    f"attn={attn_levels}, heads={attn_num_heads}, cond_mode={cond_mode}).")
+                    f"attn={attn_levels}, heads={attn_num_heads}, cond_mode={cond_mode}, "
+                    f"pad={self.flow_settings['flow_padding_mode'].get()}).")
             else:
                 self.text_encoder = None
                 self.log_rectified(
                     f"Unconditional Flow model initialized (history={history}, "
-                    f"attn={attn_levels}, heads={attn_num_heads}, cond_mode={cond_mode}).")
+                    f"attn={attn_levels}, heads={attn_num_heads}, cond_mode={cond_mode}, "
+                    f"pad={self.flow_settings['flow_padding_mode'].get()}).")
         except Exception as e:
             import traceback; traceback.print_exc()
             self.log_rectified(f"Init error: {e}")
@@ -1223,6 +1622,8 @@ class RectifiedFlowApp:
                 'model_state': state,
                 'optimizer_state': self.rectified_model.optimizer.state_dict(),
                 'flow_settings': {k: v.get() for k, v in self.flow_settings.items()},
+                'aug_settings': {k: v.get() for k, v in self.flow_aug_settings.items()
+                                 if k not in ('noise_ctx_enabled', 'noise_ctx_prob', 'noise_ctx_scale')},
                 'vae_latent': {
                     'latent_channels': self.vae_settings['vae_latent_channels'].get(),
                     'latent_h': self.vae_settings['vae_latent_h'].get(),
@@ -1234,11 +1635,11 @@ class RectifiedFlowApp:
                 'use_ot': self.rectified_model.use_ot,
                 'channel_mult': (1, 2, 4),
                 'history': self.rectified_model.history,
-                # top-level duplicates for robustness / future loaders
                 'attn_levels': self.rectified_model.model.attention_levels,
                 'attn_num_heads': self.rectified_model.model.attn_num_heads,
                 'attn_dropout': self.rectified_model.model.attn_dropout,
                 'cond_mode': self.rectified_model.cond_mode,
+                'aug_padding_mode': self.flow_aug_settings['aug_padding_mode'].get(),
             }
             if self.text_encoder is not None:
                 d['text_encoder_state'] = self.text_encoder.state_dict()
@@ -1252,7 +1653,6 @@ class RectifiedFlowApp:
         try:
             ckpt = torch.load(fname, map_location='cpu')
 
-            # --- migrate old flow_use_attention → attn_level_* ---
             fs = ckpt.get('flow_settings', {})
             if 'flow_use_attention' in fs and 'attn_level_0' not in fs:
                 v = bool(fs['flow_use_attention'])
@@ -1273,7 +1673,6 @@ class RectifiedFlowApp:
                           'latent_h': 'vae_latent_h', 'latent_w': 'vae_latent_w'}[k]
                 self.vae_settings[map_to].set(v)
 
-            # Top-level attn fields (newer checkpoints)
             if 'attn_levels' in ckpt and len(ckpt['attn_levels']) >= 3:
                 self.flow_settings['attn_level_0'].set(bool(ckpt['attn_levels'][0]))
                 self.flow_settings['attn_level_1'].set(bool(ckpt['attn_levels'][1]))
@@ -1283,9 +1682,6 @@ class RectifiedFlowApp:
             if 'attn_dropout' in ckpt:
                 self.flow_settings['attn_dropout'].set(ckpt['attn_dropout'])
 
-            # cond_mode: top-level takes priority; if neither present, default
-            # to legacy 'shift' so old checkpoints load with the correct
-            # architecture (they were trained with shift mode).
             if 'cond_mode' not in fs:
                 try:
                     self.flow_settings['cond_mode'].set('shift')
@@ -1294,6 +1690,20 @@ class RectifiedFlowApp:
             if 'cond_mode' in ckpt:
                 try:
                     self.flow_settings['cond_mode'].set(ckpt['cond_mode'])
+                except Exception:
+                    pass
+
+            # Restore aug settings if present (newer checkpoints)
+            if 'aug_settings' in ckpt:
+                for k, v in ckpt['aug_settings'].items():
+                    if k in self.flow_aug_settings:
+                        try:
+                            self.flow_aug_settings[k].set(v)
+                        except Exception:
+                            pass
+            if 'aug_padding_mode' in ckpt:
+                try:
+                    self.flow_aug_settings['aug_padding_mode'].set(ckpt['aug_padding_mode'])
                 except Exception:
                     pass
 
@@ -1375,7 +1785,6 @@ class RectifiedFlowApp:
             self.root.after(0, lambda: self.generate_btn.config(state=tk.NORMAL))
             self.root.after(0, lambda: self.stop_btn.config(state=tk.DISABLED))
 
-    # ---- non-progressive path ----
     def _generate_batch(self, n_videos, num_frames, steps, method, cond,
                         cfg_scale, use_ema):
         def _check():
@@ -1399,10 +1808,9 @@ class RectifiedFlowApp:
         self.gen_n_videos = n_videos
         self.root.after(0, self._on_generation_done)
 
-    # ---- progressive path ----
     def _generate_progressive(self, n_videos, num_frames, steps, method, cond,
                               cfg_scale, use_ema, interval):
-        decoded_per_frame = {}   # {frame_idx: decoded tensor [n_videos, C, H, W]}
+        decoded_per_frame = {}
         try:
             gen = self.rectified_model.sample_video_step_by_step(
                 n_samples=n_videos, num_frames=num_frames, cond=cond,
@@ -1428,7 +1836,6 @@ class RectifiedFlowApp:
                     0, lambda g=grid, f=fi, s=si:
                     self._update_progressive_preview(g, f, s, steps, num_frames))
         finally:
-            # Convert whatever we have into the playback layout
             if decoded_per_frame:
                 frames_pil = []
                 n_frames_done = max(decoded_per_frame.keys()) + 1
@@ -1454,7 +1861,6 @@ class RectifiedFlowApp:
             else:
                 self.root.after(0, lambda: self.gen_info.config(text="Stopped."))
 
-    # ---- helpers ----
     def _decode_video_latents(self, z_vid, n_videos):
         _, T, Cz, Hl, Wl = z_vid.shape
         flat = z_vid.reshape(n_videos * T, Cz, Hl, Wl)
@@ -1478,7 +1884,6 @@ class RectifiedFlowApp:
         return frames_pil
 
     def _build_progressive_grid(self, decoded_per_frame, n_videos, current_fi):
-        """Grid: one row per video, one column per frame generated so far."""
         thumb = 96
         n_cols = current_fi + 1
         grid = Image.new('RGB', (n_cols * thumb, n_videos * thumb), color=(100, 100, 100))
