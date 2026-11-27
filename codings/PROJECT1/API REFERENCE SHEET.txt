@@ -1,0 +1,780 @@
+===============================================================================
+API REFERENCE — flow_api.py / LDM_api.py / video_ldm_api.py / video_pixel_api.py
+Rectified Flow family (pixel images, latent images, latent video, pixel video)
+Format: "name(signature)" on one line, explanation indented below, one blank
+line between entries. Snippets are prefixed with ">>>".
+===============================================================================
+
+-------------------------------------------------------------------------------
+0. LOADING THIS FILE (importlib)
+-------------------------------------------------------------------------------
+
+Loose modules (no package), find the folder via a module spec:
+
+    >>> import importlib.util, pathlib
+    >>> root = pathlib.Path(importlib.util.find_spec("flow_api").origin).parent
+    >>> REF = (root / "api_reference.txt").read_text(encoding="utf-8")
+
+If the folder is a real package (has __init__.py):
+
+    >>> import importlib.resources as res
+    >>> REF = res.files("my_pkg").joinpath("api_reference.txt").read_text("utf-8")
+
+Load the modules themselves by path (no install needed):
+
+    >>> def load(name, path):
+    ...     s = importlib.util.spec_from_file_location(name, path)
+    ...     m = importlib.util.module_from_spec(s); s.loader.exec_module(m); return m
+    >>> flow = load("flow_api", root / "flow_api.py")
+
+Tiny lookup helper (works because entries are blank-line separated):
+
+    >>> def lookup(name, text=REF):
+    ...     for blk in text.split("\n\n"):
+    ...         if blk.strip().startswith(name + "(") or blk.strip() == name:
+    ...             return blk
+    ...     return None
+    >>> print(lookup("match_ot_batch"))
+
+-------------------------------------------------------------------------------
+1. CONVENTIONS & CONCEPTS (read once)
+-------------------------------------------------------------------------------
+
+Time convention
+    t = 0 is the SOURCE (x0), t = 1 is the DATA (x1).
+    x_t = t*x1 + (1-t)*x0 ; training target = x1 - x0 (a velocity).
+    Sampling integrates from t=0 to t=1. This is the opposite of some DDPM-style
+    code, so do not flip t when porting weights.
+
+Rectified flow
+    Instead of learning "how to denoise a little", the net learns a constant
+    direction pointing from source to data. Straight paths = few sampling steps
+    (10-30 Euler is often fine) instead of hundreds.
+
+Velocity field / v_fn
+    model(x, t, cond) -> tensor with the SAME shape as x. Every sampler in these
+    files is just an ODE integrator wrapped around that call.
+
+CFG (classifier-free guidance)
+    Train with cfg_dropout_prob > 0 so the net sometimes sees an all-zeros cond.
+    At sample time cfg_scale != 1 runs the net twice (cond + zeros) and
+    extrapolates: v = v_uncond + s*(v_cond - v_uncond). s=1 disables it (1x cost).
+
+cond tensor
+    Always [B, cond_dim] float. These flow classes do NOT own a text encoder;
+    you build one separately (TextEncoder / TransformerTextEncoder) and pass its
+    output in. cond=None means "zeros" (unconditional).
+
+OT / Sinkhorn coupling
+    Minibatch optimal transport: instead of pairing noise[i] with data[i]
+    arbitrarily, re-pair them so total squared distance is minimal -> straighter
+    paths, faster convergence. Sinkhorn = entropy-regularised, GPU, log-domain,
+    approximate; Hungarian = exact, scipy/CPU, O(B^3). Both return a hard
+    permutation.
+
+OTFM prior
+    "Designing Optimal Transport Flows" style source: a blurry low-frequency
+    version of the target blended with noise. The flow only has to invent high
+    frequencies, so transport is shorter.
+
+FiLM / AdaGN / shift / cross_attn (cond_mode)
+    shift      : add a learned per-channel bias after norm (cheapest).
+    film       : scale+shift BEFORE norm1 (h*(1+gamma)+beta).
+    adagn      : scale+shift AFTER norm1 (adaptive group norm, DDPM++ style).
+    cross_attn : spatial tokens attend to a single conditioning token.
+
+Tensor shapes used everywhere
+    image  [B, C, H, W] in [-1, 1]
+    latent [B, Cz, h, w] (unnormalised VAE mu)
+    mask   [B, 1, H, W] with 1 = regenerate, 0 = keep
+    video context [B, history, C, H, W] (oldest -> newest)
+    text   [B, max_len] long, byte values 0..255
+
+-------------------------------------------------------------------------------
+2. flow_api.py — HELPERS
+-------------------------------------------------------------------------------
+
+load_image_as_rgb(path)
+    Open any image as 3-channel RGB. RGBA is composited onto BLACK (not white),
+    so transparent PNGs get dark backgrounds.
+    >>> img = load_image_as_rgb("a.png")          # PIL.Image, mode 'RGB'
+
+load_image_as_grayscale(path)
+    Open as single-channel 'L' PIL image.
+    >>> img = load_image_as_grayscale("a.png")
+
+text_to_indices(text, max_len=128)
+    Byte-level tokenizer: ord(ch) per character, non-latin1 -> 0, truncated /
+    zero-padded to max_len. Returns a python list of ints (no tensor).
+    >>> ids = torch.tensor([text_to_indices("a cat", 64)])   # [1, 64] long
+
+get_norm(channels)
+    GroupNorm with the largest group count <= 32 that divides channels
+    (32 if channels % 32 == 0, else falls back down to 1 = LayerNorm-ish).
+    Safe for any channel count, including 3.
+    >>> norm = get_norm(96)                       # GroupNorm(32, 96)
+
+gaussian_blur_tensor(x, sigma)
+    Separable Gaussian blur on a [B, C, H, W] tensor, reflect-padded, no grad
+    tracking issues. sigma must be > 0 and small enough that the kernel
+    (2*round(3*sigma)+1) fits with reflect padding (H, W > kernel//2).
+    >>> blurry = gaussian_blur_tensor(x, 2.0)
+
+_grid_sample_pad(mode)
+    Maps torchvision padding names to grid_sample names:
+    constant->zeros, edge->border, reflect/symmetric->reflection. Unknown -> border.
+    >>> _grid_sample_pad("edge")                  # 'border'
+
+TV_ROT_HAS_PAD / TV_PERSP_HAS_PAD
+    Booleans probed at import: does this torchvision's RandomRotation /
+    RandomPerspective accept padding_mode? If False the datasets wrap them in
+    PaddedTransform instead. Read-only, useful for a settings tab tooltip.
+    >>> print(TV_ROT_HAS_PAD, TV_PERSP_HAS_PAD)
+
+-------------------------------------------------------------------------------
+3. flow_api.py — AUGMENTATIONS (PIL in, PIL out; also accept tensors)
+-------------------------------------------------------------------------------
+
+RandomJPEG(quality_low=50, quality_high=95, p=0.5)
+    Re-encodes through an in-memory JPEG at a random quality to teach robustness
+    to compression artifacts. Always returns RGB, so don't use it in a
+    grayscale pipeline.
+    >>> aug = RandomJPEG(40, 90, p=0.5); img = aug(img)
+
+ElasticTransform(alpha=30, sigma=3, p=0.5, padding_mode="edge")
+    Local non-rigid warp: random displacement field, box-smoothed (5x5), scaled
+    by alpha (pixels of max-ish displacement), applied with grid_sample.
+    sigma here scales the raw noise, it is not a Gaussian kernel width.
+    Needs H, W >= 2. padding_mode takes torchvision names (edge/reflect/...).
+    >>> img = ElasticTransform(alpha=20, sigma=3, padding_mode="reflect")(img)
+
+PaddedTransform(transform, pad_fraction=0.2, padding_mode='edge')
+    Emulates padding_mode for PIL transforms that lack it: pad by
+    pad_fraction*max(W,H) -> apply wrapped transform -> center-crop back.
+    Accepts constant/edge/reflect/symmetric (anything else falls back to edge).
+    >>> rot = transforms.RandomRotation(30)
+    >>> img = PaddedTransform(rot, 0.22, "reflect")(img)
+
+-------------------------------------------------------------------------------
+4. flow_api.py — TIME EMBEDDING & TEXT ENCODERS
+-------------------------------------------------------------------------------
+
+SinusoidalPositionEmbeddings(dim)
+    Classic sin/cos positional encoding of a scalar t in [0,1] -> [B, dim].
+    dim must be EVEN and >= 4 (dim=2 divides by zero).
+    >>> emb = SinusoidalPositionEmbeddings(128)(torch.rand(4))   # [4, 128]
+
+TextEncoder(vocab_size=256, embed_dim=64, hidden_size=64, num_layers=2, cond_dim=256)
+    BiGRU over bytes; concatenates the final forward+backward hidden states and
+    projects to cond_dim. Cheap, good default for short captions.
+    Output [B, cond_dim].
+    >>> enc = TextEncoder(**get_encoder_config("BiGRU", "small"))
+    >>> cond = enc(ids)                            # [B, 256]
+
+TransformerTextEncoder(vocab_size=256, embed_dim=128, num_heads=4, num_layers=3, ff_dim=256, cond_dim=512, max_len=128, dropout=0.1)
+    Small byte-level transformer encoder with a learnable CLS token and learned
+    positional embeddings; returns the projected CLS token (not mean pooling).
+    max_len must be >= your text length. No padding mask, so pad bytes are
+    attended to — keep captions similar in length or accept the noise.
+    >>> enc = TransformerTextEncoder(**get_encoder_config("BiTransformer", "small"))
+    >>> cond = enc(ids)                            # [B, cond_dim]
+
+TEXT_ENCODER_PRESETS
+    Nested dict: ['BiGRU'|'BiTransformer']['tiny'|'small'|'medium'|'large'].
+    BiGRU keys: embed_dim, hidden_size, num_layers, cond_dim.
+    BiTransformer keys: embed_dim, num_heads, num_layers, ff_dim, cond_dim.
+    cond_dim by size: tiny 128, small 256, medium 512, large 1024 — the flow's
+    cond_dim MUST match this.
+
+get_encoder_config(enc_type, size)
+    Returns the preset dict, ready to splat into a constructor.
+    >>> cfg = get_encoder_config("BiGRU", "small"); cfg["cond_dim"]   # 256
+
+-------------------------------------------------------------------------------
+5. flow_api.py — CONV / ATTENTION / BLOCKS / UNET
+-------------------------------------------------------------------------------
+
+Conv2dWithPadding(in_channels, out_channels, kernel_size, stride=1, padding_mode='constant', **kwargs)
+    nn.Conv2d subclass that pads manually in forward so non-constant padding
+    works. Padding is kernel_size//2, so use ODD kernels to preserve H, W.
+    IMPORTANT: padding_mode here is an F.pad mode: 'constant', 'reflect',
+    'replicate', 'circular'. 'edge'/'symmetric' are NOT valid here (those are
+    augmentation-only names; use 'replicate' for edge behaviour).
+    >>> conv = Conv2dWithPadding(3, 64, 3, padding_mode='reflect')
+
+AttentionBlock(dim, num_heads=4, dropout=0.0)
+    Pre-norm multi-head SELF-attention over flattened H*W tokens with a residual.
+    num_heads is silently reduced to the largest divisor of dim.
+    Cost is O((H*W)^2): at 32x32 that is 1024 tokens — usually turn attention off
+    at the highest resolution and on at the bottleneck.
+    >>> h = AttentionBlock(128, num_heads=4)(h)    # same shape
+
+_valid_attention_heads(dim, num_heads)
+    Helper: largest head count <= num_heads that divides dim (min 1).
+    >>> _valid_attention_heads(96, 5)              # 4
+
+_CondMixin
+    Shared conditioning plumbing for DownBlock/UpBlock. Not used directly.
+    _build_cond creates cond_proj (Linear) or cross_attn + cond_kv_proj;
+    _apply_film applies pre-norm scale/shift; _apply_cond_after_norm handles
+    shift / adagn / cross_attn.
+
+DownBlock(in_channels, out_channels, time_emb_dim, cond_dim, dropout=0.1, use_attention=False, attn_num_heads=4, attn_dropout=0.0, padding_mode='constant', cond_mode='shift')
+UpBlock(in_channels, out_channels, time_emb_dim, cond_dim, ...same args...)
+    Identical residual blocks (conv-norm-time-cond-silu-dropout-conv-norm-silu,
+    + 1x1 residual shortcut, + optional attention). Down/Up only differ in name;
+    actual resampling is done by separate strided conv / convtranspose layers in
+    the UNet. forward(x, t_emb, cond) -> [B, out_channels, H, W].
+    cond is REQUIRED (pass zeros for unconditional).
+    >>> blk = DownBlock(64, 128, 256, 256, cond_mode='adagn')
+    >>> h = blk(x, t_emb, torch.zeros(x.size(0), 256))
+
+VelocityUNet(in_channels=3, base_channels=64, time_emb_dim=256, cond_dim=256, img_size=32, channel_mult=(1,2,4), dropout=0.1, attention_levels=None, attn_num_heads=4, attn_dropout=0.0, padding_mode='constant', cond_mode='shift')
+    Pixel-space velocity network. forward(x, t, cond) -> same shape as x.
+    Depth: levels = min(number of halvings while size >= 8, len(channel_mult)) + 1,
+    so channel_mult caps the depth. 32px + (1,2,4) -> 3 levels, 2 downsamples
+    (32->16->8). 64px with (1,2,4) still only 2 downsamples (64->32->16) — pass a
+    longer channel_mult like (1,2,4,8) to go deeper.
+    attention_levels is a per-level bool list, indexed level 0 = full resolution;
+    short lists are padded with False, extras truncated. None = all True.
+    img_size should be divisible by 2^(levels-1) or skip concatenation will
+    mismatch. Defaults (base 64, attention everywhere) are roughly ~10M params;
+    base 48 or attention_levels=[False, True, True] shrinks it a lot.
+    >>> net = VelocityUNet(3, 48, cond_dim=256, img_size=32,
+    ...                    attention_levels=[False, True, True])
+    >>> v = net(x, torch.rand(x.size(0)), cond=torch.zeros(x.size(0), 256))
+
+-------------------------------------------------------------------------------
+6. flow_api.py — MINIBATCH OT COUPLING
+-------------------------------------------------------------------------------
+
+match_ot_batch_hungarian(x0, x1)
+    Exact assignment on squared-L2 cost via scipy.linear_sum_assignment (CPU
+    sync, O(B^3)). Returns (x0, x1[perm], perm). B <= 1 is a no-op.
+    >>> x0, x1, perm = match_ot_batch_hungarian(x0, x1)
+
+match_ot_batch_sinkhorn(x0, x1, epsilon=0.05, n_iters=50)
+    Log-domain Sinkhorn with uniform marginals 1/B, then a hard permutation
+    extracted by Hungarian on -P. Returns (x0, x1[perm], perm).
+    epsilon is relative to the RAW squared cost, which in pixel space is huge
+    (hundreds to thousands), so 0.05 collapses to near-nearest-neighbour. For
+    pixels use a much larger epsilon (e.g. cost.mean()-scale, 10-100) or
+    normalise; in a small latent space 0.05-1.0 is reasonable.
+    >>> x0, x1, perm = match_ot_batch_sinkhorn(x0, x1, epsilon=20.0, n_iters=50)
+
+match_ot_batch(x0, x1, method='sinkhorn', sinkhorn_eps=0.05, sinkhorn_iters=50)
+    Dispatcher used by all train_steps. method='sinkhorn' or anything else ->
+    Hungarian. Also reindex cond with the returned perm if you call it yourself.
+    >>> x0, x1, perm = match_ot_batch(x0, x1, method='hungarian')
+    >>> cond = cond[perm]
+
+-------------------------------------------------------------------------------
+7. flow_api.py — RectifiedFlowPixel (image pixel-space trainer/sampler)
+-------------------------------------------------------------------------------
+
+RectifiedFlowPixel(in_channels=3, img_size=32, base_channels=64, cond_dim=256, device=None, attention_levels=None, attn_num_heads=4, attn_dropout=0.0, task="noise", task_params=None, training_mode="dataset", padding_mode='constant', cond_mode='shift')
+    Wrapper holding .model (VelocityUNet), .optimizer (Adam lr=2e-4),
+    .criterion (MSELoss), EMA state and the task/source logic. Not an nn.Module.
+    Public attributes you can poke: use_ot, ot_method, ot_sinkhorn_eps,
+    ot_sinkhorn_iters, ema_decay, ema_mode, use_ema, task, task_params,
+    training_mode, img_size (tuple), device.
+    >>> flow = RectifiedFlowPixel(3, 32, base_channels=48, cond_dim=256,
+    ...                           task="blur_to_sharp",
+    ...                           task_params={'blur_sigma': 2.0},
+    ...                           attention_levels=[False, True, True])
+    >>> flow.use_ot = True; flow.ot_sinkhorn_eps = 20.0
+
+RectifiedFlowPixel.set_ema(decay=0.999, mode='standard')
+    Builds a frozen copy of the model as .ema_model and enables EMA. Call it
+    AFTER you load a checkpoint, since it copies current weights.
+    mode='lookahead' additionally copies EMA weights back into the live model
+    every step (slow weights, not classic Lookahead optimizer).
+    >>> flow.set_ema(0.999, 'standard')
+
+RectifiedFlowPixel.update_ema()
+    ema = decay*ema + (1-decay)*live, parameters only (no buffers exist here).
+    Called automatically at the end of train_step when use_ema is True.
+
+RectifiedFlowPixel.train_step(x1, cond=None, cfg_dropout_prob=0.0)
+    One full optimiser step. x1 is a batch of real images in [-1,1]; the source
+    x0 is synthesised from it (or from noise) according to task/training_mode.
+    cond is [B, cond_dim] or None. Returns a python float loss.
+    NOTE: any text encoder you used to make cond is NOT in flow.optimizer — add
+    its parameters yourself if you want it trained.
+    >>> loss = flow.train_step(imgs, cond=enc(ids), cfg_dropout_prob=0.1)
+
+RectifiedFlowPixel.sample(n_samples=16, cond=None, steps=50, method='euler', cfg_scale=1.0, use_ema=True, start_from=None)
+    Full generation, returns [B, C, H, W] (unclamped — clamp to [-1,1] before
+    saving). method: 'euler' (1 eval/step), 'heun'/'midpoint' (2), 'rk4' (4).
+    start_from overrides the source AND the batch size; n_samples is then
+    ignored and cond must match start_from's batch.
+    For image-to-image tasks always pass start_from, because the noise-only
+    source for e.g. grayscale_to_color is random gray noise, not a real photo.
+    >>> out = flow.sample(8, cond=cond, steps=25, method='heun', cfg_scale=2.0)
+    >>> gray = (0.299*x[:,0:1]+0.587*x[:,1:2]+0.114*x[:,2:3]).repeat(1,3,1,1)
+    >>> out = flow.sample(cond=cond, start_from=gray, steps=20)
+
+RectifiedFlowPixel.sample_step_by_step(n_samples=16, cond=None, steps=50, method='euler', cfg_scale=1.0, use_ema=True, start_from=None)
+    Generator version of sample: yields (step_index_1based, x) after each step.
+    Made for a progress bar / live preview in an inference tab.
+    >>> for i, x in flow.sample_step_by_step(4, cond=cond, steps=20):
+    ...     preview(x); bar.set(i / 20)
+
+RectifiedFlowPixel.inpaint(image, mask, steps=50, method='euler', cfg_scale=1.0, use_ema=True, cond=None, noise_sigma=1.0, composite_updates=True, full_edit_from=0.7)
+    One-shot inpainting. mask [B,1,H,W], 1 = regenerate. Starts from
+    image*(1-mask) + noise*sigma*mask. Returns the final tensor.
+    Best with task="inpainting" weights, but works as a zero-shot hack too.
+    >>> out = flow.inpaint(img, mask, cond=cond, steps=30)
+
+RectifiedFlowPixel.inpaint_step_by_step(image, mask, ...same args...)
+    Generator yielding (step_index_1based, x). While progress < full_edit_from
+    and composite_updates is True, the known region is pasted back every step
+    (keeps the untouched pixels exact); after that the whole image is free.
+    full_edit_from=1.0 -> always composite; 0.0 -> never.
+    >>> for i, x in flow.inpaint_step_by_step(img, mask, full_edit_from=0.8):
+    ...     preview(x)
+
+RectifiedFlowPixel._generate_source_from_target(x1)
+    Internal but handy for previewing a task in a settings tab: builds x0 from
+    real data (gray, blurred, quantised, pixelated, masked, averaged, OTFM...).
+    Applies source_noise_std afterwards except for noise/inpainting/otfm.
+    >>> x0 = flow._generate_source_from_target(imgs)   # preview the source
+
+RectifiedFlowPixel._generate_source_from_noise(shape)
+    Source when no target image is available (pure generation path). For
+    degradation tasks this is a degraded NOISE image, which is why start_from
+    matters at inference.
+    >>> x0 = flow._generate_source_from_noise((4, 3, 32, 32))
+
+RectifiedFlowPixel._random_inpaint_mask(shape, mask_ratio=0.3)
+    Random per-pixel Bernoulli mask, then max_pool2d(3) to make blobby holes.
+    Returns [B,1,H,W] float in {0,1}.
+    >>> m = flow._random_inpaint_mask(imgs.shape, 0.4)
+
+RectifiedFlowPixel._add_noise_to_source(x0)
+    Adds randn * (source_noise_std * 2.0) if task_params['source_noise_std'] > 0.
+    Note the x2 factor when tuning that slider.
+
+TASK / task_params REFERENCE (flow_api)
+    task="noise"                params: -                      plain generation
+    task="grayscale_to_color"   source_noise_std               3ch gray -> color
+    task="blur_to_sharp"        blur_sigma=2.0, source_noise_std
+    task="white_to_image"       source_noise_std               constant 1.0 source
+    task="average_separation"   source_noise_std               (x1+x1[perm])/2
+    task="unquantization"       bit_depth=1, source_noise_std   posterised source
+    task="pixelation"           pixelation_size=8,
+                                pixelation_rescale_mode='nearest'
+    task="inpainting"           inpaint_mask_ratio=0.3          noise-filled holes
+    task="otfm"                 otfm_alpha=0.5, otfm_downsample=4
+                                x0 = (1-a)*bicubic_up(area_down(x1)) + a*noise
+    training_mode: "dataset" = always degrade the real image,
+                   "noise"   = always synthesise from noise,
+                   anything else (e.g. "mixed") = 50/50 coin flip per step.
+
+-------------------------------------------------------------------------------
+8. flow_api.py — DATASET & UTILITIES
+-------------------------------------------------------------------------------
+
+ConditionalImageDataset(image_paths, labels_per_image, img_size=32, color_mode='rgb', aug_settings=None, text_max_len=128)
+    Image dataset returning (image [C,S,S] in [-1,1], text [max_len] long).
+    labels_per_image[i] may be a single string OR a list of captions (one is
+    picked at random each __getitem__, underscores become spaces).
+    color_mode: 'rgb' (3ch) or anything else -> grayscale (1ch).
+    Load failures print and return zeros instead of raising.
+    >>> ds = ConditionalImageDataset(paths, [["a cat", "cat photo"]], 32,
+    ...                              aug_settings={'flip_horizontal': True})
+    >>> dl = DataLoader(ds, batch_size=16, shuffle=True, num_workers=2)
+    >>> imgs, ids = next(iter(dl))                 # [16,3,32,32], [16,128]
+
+ConditionalImageDataset.apply_augmentations(pil_img)
+    Runs the built augmentation pipeline on a copy of a PIL image. Called
+    internally before Resize/ToTensor/Normalize; expose it for an aug preview.
+    >>> preview = ds.apply_augmentations(load_image_as_rgb(paths[0]))
+
+compute_head_dims(base_channels, channel_mult=(1,2,4), num_heads=4)
+    Returns [(channels, actual_heads, head_dim), ...] for a settings label.
+    Uses the FULL channel_mult, so it may list more levels than the UNet builds.
+    >>> compute_head_dims(64, (1,2,4), 4)
+    [(64, 4, 16), (128, 4, 32), (256, 4, 64)]
+
+AUG_SETTINGS KEYS (shared by both datasets; all default False / shown values)
+    aug_padding_mode        'edge' | 'constant' | 'reflect' | 'symmetric'
+    flip_horizontal         bool
+    rotation                bool  (fixed +/-30 degrees)
+    random_crop             bool, crop_scale=0.8
+    color_jitter            bool, brightness=0.2, contrast=0.2,
+                                  saturation=0.2, hue=0.1
+    random_perspective      bool, perspective_distortion=0.1
+    elastic_transform       bool, elastic_alpha=30, elastic_sigma=3
+    jpeg_compression        bool, jpeg_quality_low=50, jpeg_quality_high=95
+    stretch_vertical        bool  (RandomResizedCrop ratio 0.5-1.0)
+    stretch_horizontal      bool  (RandomResizedCrop ratio 1.0-2.0)
+
+-------------------------------------------------------------------------------
+9. LDM_api.py — VAE (stage 1)
+-------------------------------------------------------------------------------
+
+VAE_SIZE_CONFIGS
+    dict size -> (unused_depth, width_multipliers). Only the multipliers are
+    used; the count of blocks comes from the img_size/latent ratio.
+    tiny (2,[.25,.5]) small (3,[.25,.5,1]) medium (3,[.5,1,2])
+    big (3,[1,2,4]) large (3,[2,4,8])
+
+_vae_num_blocks(img_size, latent_h, latent_w)
+    Number of stride-2 blocks = log2(img_size/latent). Raises if the ratio is
+    not an integer, not square, not a power of two, or < 2.
+    >>> _vae_num_blocks(64, 8, 8)                  # 3
+
+_fit_mults(mults, n)
+    Truncates or extends a multiplier list to length n by doubling the last
+    entry. Internal, keeps VAE width configs flexible.
+
+FlexEncoder(in_channels=3, base_channels=32, latent_channels=8, latent_h=4, latent_w=4, size='big', img_size=32)
+    Strided conv stack + LeakyReLU(0.2), then two heads. forward(x) -> (mu,
+    logvar), each [B, latent_channels, latent_h, latent_w].
+
+FlexDecoder(latent_channels=8, base_channels=32, out_channels=3, latent_h=4, latent_w=4, size='big', img_size=32)
+    ConvTranspose stack ending in tanh. forward(z, target_size=None) ->
+    [B, out_channels, H, W]; bilinear-resizes if target_size differs.
+
+FlexVAE(in_channels=3, base_channels=32, latent_channels=8, latent_h=4, latent_w=4, size='big', img_size=32)
+    Plain convolutional VAE (no attention, no discriminator, no perceptual
+    loss). You train it yourself, then FREEZE it and train the flow on latents.
+    >>> vae = FlexVAE(3, 32, latent_channels=4, latent_h=8, latent_w=8,
+    ...               size='small', img_size=64).to(dev)
+    >>> rec, mu, logvar = vae(imgs)
+    >>> kl = -0.5*torch.mean(1+logvar-mu.pow(2)-logvar.exp())
+    >>> loss = F_nn.l1_loss(rec, imgs) + 1e-4*kl
+    >>> loss.backward()                            # own optimizer
+
+FlexVAE.encode(x)
+    Deterministic mu only (no sampling) — this is what you feed the flow as z1.
+    >>> z1 = vae.encode(imgs).detach()
+
+FlexVAE.decode(z, target_size=None)
+    tanh image in [-1,1]. Pass target_size=(H,W) if the pixel size is not exactly
+    latent*2^n.
+    >>> imgs = vae.decode(z, target_size=(64, 64))
+
+FlexVAE.reparameterize(mu, logvar)
+    mu + eps*exp(0.5*logvar). logvar is NOT clamped — if the VAE explodes, clamp
+    it yourself (e.g. [-30, 20]) or lower the KL weight.
+
+LATENT SCALING (important, not built in)
+    There is no 0.18215-style scale factor here. VAE mu can have std >> 1, which
+    makes the velocity targets large and MSE dominated by a few channels.
+    Measure once and normalise, then undo before decode:
+    >>> s = torch.cat([vae.encode(b) for b in sample_batches]).std()
+    >>> z1 = vae.encode(imgs) / s                  # train
+    >>> imgs = vae.decode(z * s)                   # inference
+
+-------------------------------------------------------------------------------
+10. LDM_api.py — LATENT UNET & FLOW (stage 2, images)
+-------------------------------------------------------------------------------
+
+VelocityUNet(in_channels=8, base_channels=32, time_emb_dim=128, cond_dim=256, latent_h=4, latent_w=4, channel_mult=(1,2,4), dropout=0.1, attention_levels=None, attn_num_heads=4, attn_dropout=0.0, padding_mode='constant', cond_mode='shift')
+    LDM-specific copy of the UNet: same blocks as flow_api but sized by
+    latent_h/latent_w and allowed to downsample all the way to 1x1
+    (halves while size >= 2, capped at len(channel_mult)-1).
+    4x4 latent + (1,2,4) -> 4->2->1. forward(x, t, cond) -> same shape as x.
+    Defaults are small (~2.5M params at base 32).
+    >>> net = VelocityUNet(in_channels=4, latent_h=8, latent_w=8, cond_dim=256)
+
+RectifiedFlowLatent(latent_channels=8, latent_h=4, latent_w=4, base_channels=32, cond_dim=256, device=None, attention_levels=None, attn_num_heads=4, attn_dropout=0.0, padding_mode='constant', cond_mode='shift', channel_mult=(1,2,4))
+    Image-latent flow wrapper. Holds NO VAE — you own it. Same flags as the
+    pixel version (use_ot, ot_method, ot_sinkhorn_eps, ot_sinkhorn_iters,
+    ema_*, use_ema). time_emb_dim = max(64, base_channels*4).
+    >>> ldm = RectifiedFlowLatent(4, 8, 8, base_channels=32, cond_dim=256)
+
+RectifiedFlowLatent.set_ema(decay=0.999, mode='standard')
+RectifiedFlowLatent.update_ema()
+    Same semantics as the pixel version (lookahead copies back into the live net).
+
+RectifiedFlowLatent.train_step(z0, z1, cond=None, cfg_dropout_prob=0.0)
+    YOU supply both endpoints: z0 is normally torch.randn_like(z1) and z1 the
+    (scaled) VAE mu. Returns float loss. Puts the model in train() so dropout is
+    active. OT reorders z1 and cond together.
+    >>> z1 = vae.encode(imgs).detach() / s
+    >>> loss = ldm.train_step(torch.randn_like(z1), z1,
+    ...                       cond=enc(ids), cfg_dropout_prob=0.1)
+
+RectifiedFlowLatent.sample(n_samples=16, cond=None, steps=50, method='euler', cfg_scale=1.0, use_ema=True, start_from=None)
+    Returns LATENTS [B, Cz, h, w]; decode them yourself.
+    >>> z = ldm.sample(8, cond=cond, steps=30, method='heun')
+    >>> imgs = vae.decode(z * s, target_size=(64, 64)).clamp(-1, 1)
+
+RectifiedFlowLatent.sample_step_by_step(...)
+    Generator yielding (step_index_1based, z). Decode each preview if you want
+    pixels live (costly — decode every k steps instead).
+    >>> for i, z in ldm.sample_step_by_step(4, cond=cond, steps=30):
+    ...     if i % 5 == 0: preview(vae.decode(z * s))
+
+RectifiedFlowLatent.inpaint(z_image, mask, steps=50, method='euler', cfg_scale=1.0, use_ema=True, cond=None, noise_sigma=1.0, composite_updates=True, full_edit_from=0.7)
+RectifiedFlowLatent.inpaint_step_by_step(...same...)
+    Latent-space inpainting; mask must be at LATENT resolution [B,1,h,w],
+    1 = regenerate. Downsample a pixel mask with max_pool (not bilinear) so it
+    stays binary and holes only grow.
+    >>> m = F_nn.max_pool2d(pixel_mask, kernel_size=8, stride=8)
+    >>> z = ldm.inpaint(vae.encode(img)/s, m, cond=cond, steps=30)
+
+RectifiedFlowLatent._v_fn_factory(model, cond, cfg_scale)
+RectifiedFlowLatent._step(method, t_cur, dt, z, v_fn)
+RectifiedFlowLatent._pick_model(use_ema)
+    Internal sampler plumbing (CFG closure, one integrator step, EMA selection).
+    Reuse them if you write a custom sampler loop.
+    >>> v_fn = ldm._v_fn_factory(ldm._pick_model(True), cond, 2.0)
+    >>> z = ldm._step('heun', 0.0, 0.05, z, v_fn)
+
+-------------------------------------------------------------------------------
+11. video_ldm_api.py — VIDEO (latent, autoregressive)
+-------------------------------------------------------------------------------
+
+VIDEO_EXTS / IMAGE_EXTS / _HAS_CV2 / _HAS_IMAGEIO
+    Extension tuples used by file pickers, and import probes for the two video
+    backends. Show a warning in the dataset tab if both are False and the user
+    adds an .mp4.
+    >>> if not (_HAS_CV2 or _HAS_IMAGEIO): warn("pip install opencv-python")
+
+load_video_frames(path, stride=1)
+    Loads ALL frames as a list of RGB PIL images. .gif via PIL, otherwise cv2,
+    otherwise imageio; raises RuntimeError if neither backend exists.
+    stride keeps every Nth frame. Everything lands in RAM — use stride for long
+    clips.
+    >>> frames = load_video_frames("clip.mp4", stride=2)
+
+VALID_COND_MODES
+    ('shift', 'film', 'adagn', 'cross_attn'). The video classes silently fall
+    back to 'shift' for an unknown string (the image classes raise instead).
+
+VelocityUNet(latent_channels=8, history=1, base_channels=32, time_emb_dim=128, cond_dim=256, latent_h=4, latent_w=4, channel_mult=(1,2,4), dropout=0.1, attention_levels=None, attn_num_heads=4, attn_dropout=0.0, padding_mode='constant', cond_mode='shift')
+    Temporal UNet: it is 2D, time is handled by CHANNEL CONCATENATION.
+    Input  [B, latent_channels*(1+history), H, W] = noisy current frame first,
+    then the history frames oldest -> newest.
+    Output [B, latent_channels, H, W] velocity for the current frame only.
+    .in_channels is the concatenated count; .latent_channels is per-frame.
+    >>> net = VelocityUNet(latent_channels=4, history=2, latent_h=8, latent_w=8)
+    >>> v = net(torch.cat([zt, ctx.flatten(1, 2)], 1), t, cond=cond)
+
+RectifiedFlowLatent(latent_channels=8, latent_h=4, latent_w=4, history=1, base_channels=32, cond_dim=256, device=None, attention_levels=None, attn_num_heads=4, attn_dropout=0.0, padding_mode='constant', cond_mode='shift', channel_mult=(1,2,4))
+    Autoregressive video flow (NOTE: same class name as the image one in
+    LDM_api — import them under different names). No VAE inside. history=0 is
+    allowed and makes it a per-frame image model.
+    >>> from video_ldm_api import RectifiedFlowLatent as VideoFlow
+    >>> vf = VideoFlow(latent_channels=4, latent_h=8, latent_w=8, history=2)
+
+RectifiedFlowLatent.set_ema(decay=0.999, mode='standard')
+RectifiedFlowLatent.update_ema()
+RectifiedFlowLatent._make_ema_model()
+    EMA via a factory that reuses _attn_kwargs, so architecture flags survive.
+
+RectifiedFlowLatent.train_step(z0, z1, cond=None, context=None, cfg_dropout_prob=0.0, noise_ctx_prob=0.0, noise_ctx_scale=0.5)
+    z0/z1 [B,C,H,W] for the TARGET frame; context [B,history,C,H,W] for the
+    previous frames (zeros at clip start). context is flattened and concatenated
+    to the noisy input. noise_ctx_prob adds Gaussian noise of scale
+    noise_ctx_scale to randomly chosen context frames — cheap defence against
+    drift/exposure bias when the model later conditions on its own output.
+    Returns float loss.
+    >>> seq, ids = next(iter(dl))                  # [B, H+1, C, S, S]
+    >>> z = vae.encode(seq.flatten(0,1)).unflatten(0, seq.shape[:2]) / s
+    >>> ctx, z1 = z[:, :-1], z[:, -1]
+    >>> loss = vf.train_step(torch.randn_like(z1), z1, cond=enc(ids),
+    ...                      context=ctx, cfg_dropout_prob=0.1,
+    ...                      noise_ctx_prob=0.2, noise_ctx_scale=0.3)
+
+RectifiedFlowLatent.sample_frame(n_samples=16, cond=None, steps=50, method='euler', cfg_scale=1.0, use_ema=True, start_from=None, context=None)
+    Samples ONE frame given context. Returns [B,C,H,W] latents.
+    >>> z = vf.sample_frame(1, cond=cond, context=ctx, steps=20)
+
+RectifiedFlowLatent.sample_video(n_samples=1, num_frames=16, cond=None, steps=50, method='euler', cfg_scale=1.0, use_ema=True, init_context=None, progress_cb=None, stop_check=None)
+    Rolling generation: sample frame -> push into context (drop oldest) ->
+    repeat. Returns [B, num_frames, C, H, W] or None if stopped before frame 1.
+    init_context [B,history,C,H,W]; default zeros (a "cold start").
+    progress_cb(done, total) is called per frame; stop_check() is polled per
+    frame and aborts cleanly.
+    >>> vid = vf.sample_video(1, 24, cond=cond, steps=20,
+    ...                       progress_cb=lambda i, n: bar.set(i/n),
+    ...                       stop_check=lambda: cancel_flag)
+    >>> frames = vae.decode(vid.flatten(0,1) * s).unflatten(0, vid.shape[:2])
+
+RectifiedFlowLatent.sample_video_step_by_step(n_samples=1, num_frames=16, cond=None, steps=50, method='euler', cfg_scale=1.0, use_ema=True, init_context=None)
+    Generator yielding (frame_idx, step_idx_1based, frames_list) where
+    frames_list = finished frames + the current partially-denoised one. Ideal
+    for a live filmstrip. Clones every step, so keep num_frames modest.
+    >>> for fi, si, frames in vf.sample_video_step_by_step(1, 12, steps=15):
+    ...     preview(vae.decode(frames[-1] * s))
+
+RectifiedFlowLatent._v_fn_factory(model, n, cond, cfg_scale, ctx_flat=None)
+RectifiedFlowLatent._step(method, t_cur, dt, z, v_fn)
+    Internal: CFG closure that re-concatenates the fixed context every eval, and
+    the shared integrator step (euler/heun/midpoint/rk4).
+
+VideoFrameDataset(sources, labels, img_size=32, color_mode='rgb', history=1, aug_settings=None, text_max_len=128)
+    Returns (seq [history+1, C, S, S] in [-1,1], text [max_len] long); the LAST
+    frame is the target, the rest is context, zero-padded before clip start.
+    sources is a list of dicts:
+        {'kind':'image',  'path': p}
+        {'kind':'video',  'path': p, 'stride': 1}
+        {'kind':'folder', 'path': d, 'paths': [files], 'stride': 1}
+    labels[i] MUST be a LIST of captions (a bare string gets random.choice'd
+    into a single character). history is forced to >= 1. All frames of all
+    sources are decoded into RAM at construction. One sample per temporal
+    window, so len(ds) ~ total frames.
+    >>> ds = VideoFrameDataset([{'kind':'video','path':'a.mp4','stride':2}],
+    ...                        [["a bouncing ball"]], img_size=32, history=2)
+    >>> seq, ids = ds[0]                         # [3,3,32,32], [128]
+
+VideoFrameDataset.apply_aug(pil)
+    Applies the shared augmentation pipeline. __getitem__ reseeds random and
+    torch with one seed per window so all frames get the SAME augmentation
+    (otherwise the clip would jitter). Side effect: it touches global RNG state,
+    which is fine in workers but surprising if you rely on global randomness.
+
+VideoFrameDataset._build_aug_pipeline(a)
+VideoFrameDataset._load_source_frames(src)
+    Internals: same keys as AUG_SETTINGS above; frame decoding per source kind
+    with per-file error skipping.
+
+-------------------------------------------------------------------------------
+12. video_pixel_api.py — VIDEO (pixel space, no VAE)
+-------------------------------------------------------------------------------
+
+RectifiedFlowPixelVideo(in_channels=3, img_size=32, history=1, base_channels=32, cond_dim=256, device=None, attention_levels=None, attn_num_heads=4, attn_dropout=0.0, padding_mode='constant', cond_mode='shift', channel_mult=(1,2,4))
+    Subclass of video_ldm_api.RectifiedFlowLatent with pixel naming: it passes
+    latent_channels=in_channels and latent_h=latent_w=img_size. Everything
+    (train_step, sample_frame, sample_video, step-by-step, EMA, OT) is inherited
+    unchanged — just skip the VAE entirely and feed [-1,1] frames.
+    Aliases: .in_channels, .img_size, .pixel_h, .pixel_w (read-only properties
+    over latent_h/latent_w).
+    Because "latents" are pixels here, attention at level 0 is expensive:
+    prefer attention_levels=[False, True, True] and a small base_channels.
+    >>> from video_pixel_api import RectifiedFlowPixelVideo
+    >>> pv = RectifiedFlowPixelVideo(3, 32, history=2, base_channels=32,
+    ...                              attention_levels=[False, True, True])
+    >>> seq, ids = next(iter(dl))                # [B,3,3,32,32]
+    >>> ctx, x1 = seq[:, :-1], seq[:, -1]
+    >>> loss = pv.train_step(torch.randn_like(x1), x1, cond=enc(ids),
+    ...                      context=ctx, cfg_dropout_prob=0.1)
+    >>> vid = pv.sample_video(1, 16, cond=enc(ids), steps=20)   # [1,16,3,32,32]
+    >>> grid = ((vid[0].clamp(-1,1)+1)/2)        # straight to PIL, no decode
+
+RectifiedFlowPixelVideo.pixel_h / pixel_w
+    Properties returning latent_h / latent_w, i.e. the actual pixel size.
+
+-------------------------------------------------------------------------------
+13. RECIPES
+-------------------------------------------------------------------------------
+
+Minimal pixel-image training loop (with a trainable text encoder)
+    >>> enc = TextEncoder(**get_encoder_config("BiGRU", "small")).to(dev)
+    >>> flow = RectifiedFlowPixel(3, 32, base_channels=48, cond_dim=256,
+    ...                           attention_levels=[False, True, True])
+    >>> opt = torch.optim.AdamW(list(flow.model.parameters()) +
+    ...                         list(enc.parameters()), lr=2e-4)
+    >>> flow.optimizer = opt                     # one optimizer for both
+    >>> flow.set_ema(0.999)
+    >>> for imgs, ids in dl:
+    ...     loss = flow.train_step(imgs.to(dev), cond=enc(ids.to(dev)),
+    ...                            cfg_dropout_prob=0.1)
+
+Two-stage LDM
+    >>> # 1) train FlexVAE, then freeze
+    >>> for p in vae.parameters(): p.requires_grad = False
+    >>> vae.eval()
+    >>> # 2) train the flow on scaled mu
+    >>> z1 = vae.encode(imgs.to(dev)).detach() / s
+    >>> ldm.train_step(torch.randn_like(z1), z1, cond=enc(ids.to(dev)))
+
+Checkpointing (no helpers are provided; the wrappers are not nn.Modules)
+    >>> torch.save({'model': flow.model.state_dict(),
+    ...             'ema': flow.ema_model.state_dict() if flow.ema_model else None,
+    ...             'opt': flow.optimizer.state_dict(),
+    ...             'enc': enc.state_dict(),
+    ...             'cfg': {'base_channels': 48, 'cond_dim': 256,
+    ...                     'attention_levels': [False, True, True]}}, "ck.pt")
+    >>> ck = torch.load("ck.pt", map_location=dev)
+    >>> flow = RectifiedFlowPixel(**ck['cfg']); flow.model.load_state_dict(ck['model'])
+    >>> flow.set_ema(0.999)                      # build EMA BEFORE loading it
+    >>> if ck['ema']: flow.ema_model.load_state_dict(ck['ema'])
+
+Suggested tab mapping (tkinter apps)
+    dataset    : load_image_as_*, load_video_frames, ConditionalImageDataset,
+                 VideoFrameDataset, aug preview via apply_augmentations/apply_aug
+    settings   : get_encoder_config, compute_head_dims, VAE_SIZE_CONFIGS,
+                 task/task_params, cond_mode, padding_mode, OT + EMA flags
+    training   : train_step, update_ema/set_ema, loss curve, checkpoint save
+    inference  : sample / sample_step_by_step / sample_video*,
+                 inpaint*, vae.decode, clamp(-1,1) then to PIL
+
+-------------------------------------------------------------------------------
+14. GOTCHAS (worth reading before debugging)
+-------------------------------------------------------------------------------
+
+padding_mode means two different things
+    Model/conv: F.pad names -> 'constant', 'reflect', 'replicate', 'circular'.
+    Augmentations: torchvision names -> 'constant', 'edge', 'reflect', 'symmetric'.
+    Passing 'edge' to a UNet raises; passing 'replicate' to an aug falls back.
+
+cond is effectively mandatory in every UNet.forward
+    The blocks always call cond_proj/cross_attn. Passing cond=None crashes;
+    pass torch.zeros(B, cond_dim) for unconditional. The flow wrappers do this
+    for you.
+
+cond_dim must match everywhere
+    encoder preset cond_dim == flow(cond_dim=...) == UNet(cond_dim=...).
+    A mismatch is a Linear shape error on the first train_step.
+
+Text encoders are not owned or optimised by the flow classes
+    flow.optimizer only contains flow.model parameters.
+
+Spatial sizes
+    Pixel UNet: img_size divisible by 2^(levels-1); channel_mult caps depth.
+    VAE: img_size/latent must be a square power-of-two ratio >= 2.
+    Skip connections use torch.cat, so an odd size shows up as a channel/size
+    mismatch inside UpBlock, not as a nice error.
+
+OT epsilon is scale-dependent
+    Squared-L2 over flattened pixels is O(1000); eps=0.05 degenerates. Use a
+    large eps for pixels, small for latents, or normalise the cost.
+    Hungarian path needs scipy and syncs to CPU.
+
+Sampler output is unclamped
+    clamp(-1,1) before ToPILImage, and remember x = (x+1)/2 for [0,1].
+
+n_samples vs start_from
+    start_from wins; batch size and cond must agree with it.
+
+Degradation tasks need start_from at inference
+    _generate_source_from_noise cannot invent a real grayscale/blurred photo.
+
+unquantization can leave [-1,1]
+    floor(x01*levels)/(levels-1) overshoots on the top bin (bit_depth=1 gives
+    x0 up to 3.0). Clamp the source if that bothers you.
+
+pixelation_size must be <= H,W and ideally divide them
+    Otherwise the source is cropped then zero-padded on the right/bottom edge.
+
+source_noise_std is doubled internally (randn * std * 2.0).
+
+Attention memory is quadratic in H*W
+    Turn level-0 attention off for pixel models at >= 32px.
+
+SinusoidalPositionEmbeddings needs even dim >= 4.
+
+Same class names in different modules
+    VelocityUNet exists in flow_api, LDM_api and video_ldm_api;
+    RectifiedFlowLatent exists in LDM_api (images) and video_ldm_api (video).
+    Always alias your imports.
+
+Video has no .sample()
+    Use sample_frame / sample_video / sample_video_step_by_step.
+
+VideoFrameDataset labels must be lists of strings, and it reseeds global RNG
+    per window; it also holds every decoded frame in RAM.
+
+EMA 'lookahead' overwrites live weights each step
+    Fine if intended, surprising if you just wanted averaged eval weights.
+
+No AMP, no grad clipping, no lr scheduling built in
+    Add torch.amp / clip_grad_norm_ around train_step if you need them;
+    note train_step does zero_grad/backward/step internally.
+===============================================================================
